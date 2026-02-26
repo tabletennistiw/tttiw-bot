@@ -1,7 +1,14 @@
 // TTTIW Discord Bot
-// Listens for match results in the format: [winner] [loser] ##-##
-// e.g. "John Jane 3-1" or "John Jane 11-9"
-// Then updates Firestore ratings and posts a full match summary.
+//
+// Match reporting (first player always wins):
+//   inoo ath
+//   inoo ath 10-8
+//   inoo ath 10 8
+//   inoo 10 ath 8
+//
+// Commands (prefix: ttt):
+//   ttt vs [player1] [player2]      — head-to-head record + win probability
+//   ttt rating farm [player]        — top 3 opponents to beat for most elo gain
 //
 // Setup:
 //   npm install discord.js firebase-admin
@@ -12,24 +19,22 @@ import { initializeApp, cert } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;         // your bot token
-const CHANNEL_ID    = process.env.CHANNEL_ID || null;    // restrict to one channel, or null for all
+const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
+const CHANNEL_ID          = process.env.CHANNEL_ID || null;
 const FIREBASE_PROJECT_ID = 'tttiw-6d44e';
+const PREFIX              = 'ttt';
 
 // ── FIREBASE ADMIN INIT ───────────────────────────────────────────────────────
-// Requires GOOGLE_APPLICATION_CREDENTIALS env var pointing to your service account JSON
-// OR set FIREBASE_SERVICE_ACCOUNT to the JSON string directly
 let firebaseCredential;
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   firebaseCredential = cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT));
 } else {
   firebaseCredential = cert(process.env.GOOGLE_APPLICATION_CREDENTIALS);
 }
-
 initializeApp({ credential: firebaseCredential, projectId: FIREBASE_PROJECT_ID });
 const db = getFirestore();
 
-// ── GLICKO-2 CONSTANTS (must match index.html) ────────────────────────────────
+// ── GLICKO-2 (must match index.html) ─────────────────────────────────────────
 const SCALE         = 173.7178;
 const SIGMA_DEFAULT = 0.06;
 const SIGMA_MAX     = 0.30;
@@ -52,11 +57,11 @@ function computeNewSigma(sigma, phi, v, delta) {
   let A = a, B = delta2 > phi2 + v ? Math.log(delta2 - phi2 - v) : (() => {
     let k = 1; while (f(a - k * TAU) < 0) k++; return a - k * TAU;
   })();
-  let fA = f(A), fB = f(B), iterations = 0;
-  while (Math.abs(B - A) > EPSILON && iterations < 500) {
+  let fA = f(A), fB = f(B), itr = 0;
+  while (Math.abs(B - A) > EPSILON && itr < 500) {
     const C = A + (A - B) * fA / (fB - fA), fC = f(C);
     if (fC * fB <= 0) { A = B; fA = fB; } else { fA /= 2; }
-    B = C; fB = fC; iterations++;
+    B = C; fB = fC; itr++;
   }
   return Math.exp(A / 2);
 }
@@ -89,41 +94,56 @@ function g2Update(player, opps) {
   };
 }
 
-// ── MATCH REGEX ───────────────────────────────────────────────────────────────
-// Matches: "PlayerOne PlayerTwo 11-9"  or  "@mention @mention 3-1"
-// First name = winner, second name = loser
-const MATCH_RE = /^([^\s]+)\s+([^\s]+)\s+(\d{1,2})-(\d{1,2})$/i;
+function winProb(a, b) {
+  const { mu, phi } = toG2(a.rating, a.rd);
+  const { mu: muj, phi: phij } = toG2(b.rating, b.rd);
+  return (E(mu, muj, phij) * 100).toFixed(1);
+}
 
-// ── HELPERS ───────────────────────────────────────────────────────────────────
-function r2(n) { return Math.round(n * 10) / 10; }
-function signed(n) { return (n >= 0 ? '+' : '') + r2(n); }
-
-async function findPlayer(nameOrMention) {
-  // Strip Discord mention formatting <@123456>
-  const stripped = nameOrMention.replace(/^<@!?(\d+)>$/, '$1');
-  const snap = await db.collection('players').get();
-  // Try exact name match (case-insensitive), then Discord ID match (if stored)
-  for (const d of snap.docs) {
-    const data = d.data();
-    if (data.name?.toLowerCase() === stripped.toLowerCase()) return { id: d.id, ...data };
-    if (data.discordId === stripped) return { id: d.id, ...data };
+// ── MATCH PARSER ──────────────────────────────────────────────────────────────
+function parseMatchMessage(content) {
+  const t = content.trim().split(/\s+/);
+  if (t.length === 4 && /^\d+$/.test(t[1]) && /^\d+$/.test(t[3]))
+    return { winnerStr: t[0], loserStr: t[2], s1: t[1], s2: t[3] };
+  if (t.length === 3 && /^\d+-\d+$/.test(t[2])) {
+    const [s1, s2] = t[2].split('-');
+    return { winnerStr: t[0], loserStr: t[1], s1, s2 };
   }
+  if (t.length === 4 && /^\d+$/.test(t[2]) && /^\d+$/.test(t[3]))
+    return { winnerStr: t[0], loserStr: t[1], s1: t[2], s2: t[3] };
+  if (t.length === 2)
+    return { winnerStr: t[0], loserStr: t[1], s1: null, s2: null };
   return null;
 }
 
-async function getLeaderboard() {
-  const snap = await db.collection('players').get();
-  return snap.docs
-    .map(d => ({ id: d.id, ...d.data() }))
-    .filter(p => p.rd <= 100)
-    .sort((a, b) => b.rating - a.rating);
-}
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function r2(n)     { return Math.round(n * 10) / 10; }
+function signed(n) { return (n >= 0 ? '+' : '') + r2(n); }
 
 function rankEmoji(rank) {
   if (rank === 1) return '🥇';
   if (rank === 2) return '🥈';
   if (rank === 3) return '🥉';
   return `#${rank}`;
+}
+
+async function getAllPlayers() {
+  const snap = await db.collection('players').get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+async function findPlayer(nameOrMention) {
+  const stripped = nameOrMention.replace(/^<@!?(\d+)>$/, '$1');
+  const players = await getAllPlayers();
+  return players.find(p =>
+    p.name?.toLowerCase() === stripped.toLowerCase() ||
+    p.discordId === stripped
+  ) || null;
+}
+
+async function getLeaderboard() {
+  const players = await getAllPlayers();
+  return players.filter(p => p.rd <= 100).sort((a, b) => b.rating - a.rating);
 }
 
 // ── CORE MATCH SUBMISSION ─────────────────────────────────────────────────────
@@ -147,8 +167,6 @@ async function submitMatch(winner, loser, scoreStr) {
     );
 
     const now = Date.now();
-
-    // Check for #1 change
     const allSnap = await db.collection('players').get();
     const allP = allSnap.docs.map(d => ({ id: d.id, ...d.data() }));
     const ranked = p => p.rd <= 100;
@@ -168,9 +186,8 @@ async function submitMatch(winner, loser, scoreStr) {
         const oldTop = allP.find(p => p.id === topBefore.id);
         if (oldTop?.no1Since) {
           const dur = now - (oldTop.no1Since || now);
-          const prev = oldTop.longestNo1Ms || 0;
           const upd = { no1Since: null };
-          if (dur > prev) upd.longestNo1Ms = dur;
+          if (dur > (oldTop.longestNo1Ms || 0)) upd.longestNo1Ms = dur;
           if (oldTop.id === winner.id) Object.assign(wUpdate, upd);
           else if (oldTop.id === loser.id) Object.assign(lUpdate, upd);
           else await tx.update(db.collection('players').doc(oldTop.id), upd);
@@ -210,23 +227,19 @@ async function submitMatch(winner, loser, scoreStr) {
   });
 }
 
-// ── BUILD DISCORD EMBED ───────────────────────────────────────────────────────
+// ── MATCH RESULT EMBED ────────────────────────────────────────────────────────
 async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
   const { w, l, uw, ul, no1Change, topAfter } = result;
 
   const wDelta = Math.round((uw.rating - w.rating) * 10) / 10;
   const lDelta = Math.round((ul.rating - l.rating) * 10) / 10;
 
-  // Get updated leaderboard for standings
   const lb = await getLeaderboard();
   const wRank = lb.findIndex(p => p.id === winnerData.id) + 1;
   const lRank = lb.findIndex(p => p.id === loserData.id) + 1;
 
-  // Top 5 standings
   const top5 = lb.slice(0, 5).map((p, i) => {
-    const isWinner = p.id === winnerData.id;
-    const isLoser  = p.id === loserData.id;
-    const tag = isWinner ? ' ← W' : isLoser ? ' ← L' : '';
+    const tag = p.id === winnerData.id ? ' ← W' : p.id === loserData.id ? ' ← L' : '';
     return `${rankEmoji(i + 1)} **${p.name}** — ${r2(p.rating)}${tag}`;
   }).join('\n');
 
@@ -249,7 +262,7 @@ async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
         value: [
           `${r2(l.rating)} → **${r2(ul.rating)}** (${signed(lDelta)})`,
           `RD: ${r2(l.rd)} → ${r2(ul.rd)}`,
-          `Record: ${w.wins || 0}W – ${(l.losses || 0) + 1}L`,
+          `Record: ${l.wins || 0}W – ${(l.losses || 0) + 1}L`,
           lRank ? `Rank: ${rankEmoji(lRank)}` : '',
         ].filter(Boolean).join('\n'),
         inline: true,
@@ -267,6 +280,100 @@ async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
   }
 
   return embed;
+}
+
+// ── COMMAND: ttt vs [p1] [p2] ────────────────────────────────────────────────
+async function cmdVs(message, args) {
+  if (args.length < 2) return message.reply('Usage: `ttt vs [player1] [player2]`');
+
+  const [p1, p2] = await Promise.all([findPlayer(args[0]), findPlayer(args[1])]);
+  if (!p1) return message.reply(`❌ Player not found: **${args[0]}**`);
+  if (!p2) return message.reply(`❌ Player not found: **${args[1]}**`);
+  if (p1.id === p2.id) return message.reply(`❌ That's the same person!`);
+
+  const matchSnap = await db.collection('matches').get();
+  const h2h = matchSnap.docs.map(d => d.data()).filter(m =>
+    (m.winnerId === p1.id && m.loserId === p2.id) ||
+    (m.winnerId === p2.id && m.loserId === p1.id)
+  );
+
+  const p1wins = h2h.filter(m => m.winnerId === p1.id).length;
+  const p2wins = h2h.filter(m => m.winnerId === p2.id).length;
+  const total  = h2h.length;
+
+  const p1WinPct = winProb(p1, p2);
+  const p2WinPct = (100 - parseFloat(p1WinPct)).toFixed(1);
+
+  const embed = new EmbedBuilder()
+    .setColor(0xc9a0dc)
+    .setTitle(`🏓 ${p1.name} vs ${p2.name}`)
+    .addFields(
+      {
+        name: p1.name,
+        value: [
+          `Rating: **${r2(p1.rating)}** (RD ${r2(p1.rd)})`,
+          `H2H wins: **${p1wins}**`,
+          `Win prob: **${p1WinPct}%**`,
+        ].join('\n'),
+        inline: true,
+      },
+      {
+        name: p2.name,
+        value: [
+          `Rating: **${r2(p2.rating)}** (RD ${r2(p2.rd)})`,
+          `H2H wins: **${p2wins}**`,
+          `Win prob: **${p2WinPct}%**`,
+        ].join('\n'),
+        inline: true,
+      },
+      {
+        name: 'Head-to-Head Record',
+        value: total > 0
+          ? `${p1.name} **${p1wins}** – **${p2wins}** ${p2.name}  _(${total} match${total !== 1 ? 'es' : ''})_`
+          : '_No matches played yet_',
+      }
+    )
+    .setFooter({ text: 'TTTIW · Table Tennis Texas InventionWorks' })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
+}
+
+// ── COMMAND: ttt rating farm [player] ────────────────────────────────────────
+async function cmdRatingFarm(message, args) {
+  if (args.length < 1) return message.reply('Usage: `ttt rating farm [player]`');
+
+  const player = await findPlayer(args[0]);
+  if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
+
+  const allPlayers = await getAllPlayers();
+  const others = allPlayers.filter(p => p.id !== player.id);
+
+  const gains = others.map(opp => {
+    const result = g2Update(
+      { rating: player.rating, rd: player.rd, sigma: player.sigma || SIGMA_DEFAULT },
+      [{ rating: opp.rating, rd: opp.rd, sigma: opp.sigma || SIGMA_DEFAULT, s: 1 }]
+    );
+    const gain = Math.round((result.rating - player.rating) * 10) / 10;
+    const prob = winProb(player, opp);
+    return { opp, gain, prob };
+  }).sort((a, b) => b.gain - a.gain).slice(0, 3);
+
+  if (gains.length === 0) return message.reply('No other players found.');
+
+  const medals = ['🥇', '🥈', '🥉'];
+  const lines = gains.map((g, i) =>
+    `${medals[i]} **${g.opp.name}** — **+${g.gain} elo** if you win  _(${g.prob}% chance)_\n　Rating: ${r2(g.opp.rating)} · RD: ${r2(g.opp.rd)}`
+  ).join('\n\n');
+
+  const embed = new EmbedBuilder()
+    .setColor(0x7ec8a0)
+    .setTitle(`📈 Rating farm targets for ${player.name}`)
+    .setDescription(lines)
+    .setFooter({ text: 'TTTIW · Table Tennis Texas InventionWorks' })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
 }
 
 // ── DISCORD CLIENT ────────────────────────────────────────────────────────────
@@ -287,29 +394,46 @@ client.on('messageCreate', async message => {
   if (CHANNEL_ID && message.channelId !== CHANNEL_ID) return;
 
   const content = message.content.trim();
-  const match = content.match(MATCH_RE);
-  if (!match) return;
 
-  const [, winnerStr, loserStr, s1, s2] = match;
-  const scoreStr = `${s1}-${s2}`;
+  // ── PREFIX COMMANDS ──
+  if (content.toLowerCase().startsWith(PREFIX + ' ')) {
+    const rest  = content.slice(PREFIX.length + 1).trim();
+    const parts = rest.split(/\s+/);
+    const cmd   = parts[0]?.toLowerCase();
+    const sub   = parts[1]?.toLowerCase();
 
-  // Validate score — winner's score must be higher
-  if (parseInt(s1) <= parseInt(s2)) {
-    return message.reply(`❌ The first player is the winner — their score (${s1}) should be higher than the loser's (${s2}). Did you mean \`${loserStr} ${winnerStr} ${s2}-${s1}\`?`);
+    await message.channel.sendTyping();
+    try {
+      if (cmd === 'vs')                          return await cmdVs(message, parts.slice(1));
+      if (cmd === 'rating' && sub === 'farm')    return await cmdRatingFarm(message, parts.slice(2));
+    } catch (err) {
+      console.error('Command error:', err);
+      return message.reply(`❌ Error: ${err.message}`);
+    }
+    return;
+  }
+
+  // ── MATCH REPORTING ──
+  const parsed = parseMatchMessage(content);
+  if (!parsed) return;
+
+  const { winnerStr, loserStr, s1, s2 } = parsed;
+  const scoreStr = s1 != null ? `${s1}-${s2}` : null;
+
+  if (s1 != null && parseInt(s1) <= parseInt(s2)) {
+    return message.reply(`❌ First player is the winner — their score (${s1}) should be higher than the loser's (${s2}). Did you mean \`${loserStr} ${winnerStr} ${s2}-${s1}\`?`);
   }
 
   await message.channel.sendTyping();
 
-  // Look up players
   const [winner, loser] = await Promise.all([findPlayer(winnerStr), findPlayer(loserStr)]);
-
-  if (!winner) return message.reply(`❌ Couldn't find a player named **${winnerStr}**. Check the spelling matches their name on the leaderboard.`);
-  if (!loser)  return message.reply(`❌ Couldn't find a player named **${loserStr}**. Check the spelling matches their name on the leaderboard.`);
+  if (!winner) return message.reply(`❌ Player not found: **${winnerStr}** — check spelling matches the leaderboard.`);
+  if (!loser)  return message.reply(`❌ Player not found: **${loserStr}** — check spelling matches the leaderboard.`);
   if (winner.id === loser.id) return message.reply(`❌ A player can't play themselves!`);
 
   try {
     const result = await submitMatch(winner, loser, scoreStr);
-    const embed = await buildResultEmbed(winner, loser, result, scoreStr);
+    const embed  = await buildResultEmbed(winner, loser, result, scoreStr);
     await message.reply({ embeds: [embed] });
   } catch (err) {
     console.error('Match submission error:', err);
