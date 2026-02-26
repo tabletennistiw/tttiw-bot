@@ -132,6 +132,7 @@ function rankEmoji(rank) {
 }
 
 function footer() { return { text: 'TTTIW · Table Tennis Texas InventionWorks' }; }
+function rat(p) { return `${r2(p.rating)} ±${r2(p.rd)}`; }
 
 async function getAllPlayers() {
   const snap = await db.collection('players').get();
@@ -259,7 +260,7 @@ async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
 
   const top5 = lb.slice(0, 5).map((p, i) => {
     const tag = p.id === winnerData.id ? ' <- W' : p.id === loserData.id ? ' <- L' : '';
-    return `${rankEmoji(i + 1)} **${p.name}** -- ${r2(p.rating)}${tag}`;
+    return `${rankEmoji(i + 1)} **${p.name}** — ${rat(p)}${tag}`;
   }).join('\n');
 
   const embed = new EmbedBuilder()
@@ -269,8 +270,7 @@ async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
       {
         name: `🏆 ${w.name}`,
         value: [
-          `${r2(w.rating)} → **${r2(uw.rating)}** (${signed(wDelta)})`,
-          `RD: ${r2(w.rd)} → ${r2(uw.rd)}`,
+          `${rat(w)} → **${rat(uw)}** (${signed(wDelta)})`,
           `Record: ${(w.wins || 0) + 1}W – ${w.losses || 0}L`,
           wRank ? `Rank: ${rankEmoji(wRank)}` : '',
         ].filter(Boolean).join('\n'),
@@ -279,8 +279,7 @@ async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
       {
         name: `😔 ${l.name}`,
         value: [
-          `${r2(l.rating)} → **${r2(ul.rating)}** (${signed(lDelta)})`,
-          `RD: ${r2(l.rd)} → ${r2(ul.rd)}`,
+          `${rat(l)} → **${rat(ul)}** (${signed(lDelta)})`,
           `Record: ${l.wins || 0}W – ${(l.losses || 0) + 1}L`,
           lRank ? `Rank: ${rankEmoji(lRank)}` : '',
         ].filter(Boolean).join('\n'),
@@ -371,7 +370,7 @@ async function cmdStats(message, args) {
     .setColor(0xE5B25D)
     .setTitle(`👤 ${player.name}`)
     .addFields(
-      { name: 'Rating',   value: `**${r2(player.rating)}** (RD ${r2(player.rd)})`, inline: true },
+      { name: 'Rating',   value: `**${rat(player)}**`, inline: true },
       { name: 'Rank',     value: rank ? rankEmoji(rank) : '_Unranked_',             inline: true },
       { name: 'Record',   value: `${wins}W – ${losses}L`,                           inline: true },
       { name: 'Win Rate', value: pct(wins, wins + losses),                          inline: true },
@@ -425,17 +424,58 @@ async function cmdRank(message, args) {
   const rank = lb.findIndex(p => p.id === player.id) + 1;
 
   if (!rank) return message.reply(`**${player.name}** is currently unranked (RD too high).`);
-  await message.reply(`${rankEmoji(rank)} **${player.name}** is ranked **#${rank}** with a rating of **${r2(player.rating)}**`);
+  await message.reply(`${rankEmoji(rank)} **${player.name}** is ranked **#${rank}** with a rating of **${rat(player)}**`);
 }
 
 // ── COMMAND: ttt top ──────────────────────────────────────────────────────────
 async function cmdTop(message) {
-  const lb = await getLeaderboard();
+  const [lb, allMatches] = await Promise.all([getLeaderboard(), getAllMatches()]);
   if (!lb.length) return message.reply('No ranked players yet.');
 
+  const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+
+  // For each player, rewind their rating to 3 days ago by undoing recent matches
+  // We do this by finding their rating before their oldest recent match
+  const oldRatingMap = {};
+  for (const p of lb) {
+    const recentMatches = allMatches.filter(m => {
+      const ts = m.date?.toDate ? m.date.toDate().getTime() : new Date(m.date).getTime();
+      return ts >= cutoff && (m.winnerId === p.id || m.loserId === p.id);
+    });
+    if (!recentMatches.length) {
+      oldRatingMap[p.id] = p.rating; // no change
+      continue;
+    }
+    // Find rating before the earliest recent match by using oldRating stored on the match
+    const earliest = recentMatches[recentMatches.length - 1]; // matches are desc
+    if (earliest.winnerId === p.id) {
+      oldRatingMap[p.id] = earliest.p1oldRating ?? p.rating;
+    } else {
+      oldRatingMap[p.id] = earliest.p2oldRating ?? p.rating;
+    }
+  }
+
+  // Build old leaderboard snapshot using old ratings
+  const oldLb = lb
+    .map(p => ({ ...p, rating: oldRatingMap[p.id] ?? p.rating }))
+    .filter(p => p.rd <= 100)
+    .sort((a, b) => b.rating - a.rating);
+
+  const oldRankMap = {};
+  oldLb.forEach((p, i) => { oldRankMap[p.id] = i + 1; });
+
   const lines = lb.map((p, i) => {
+    const currentRank = i + 1;
+    const oldRank = oldRankMap[p.id];
     const wins = p.wins || 0, losses = p.losses || 0;
-    return `${rankEmoji(i + 1)} **${p.name}** — ${r2(p.rating)}  _(${wins}W–${losses}L)_`;
+
+    let change = '';
+    if (oldRank && oldRank !== currentRank) {
+      const diff = oldRank - currentRank; // positive = moved up
+      change = diff > 0 ? ` ↑${diff}` : ` ↓${Math.abs(diff)}`;
+    }
+
+    return `${rankEmoji(currentRank)} **${p.name}** — ${rat(p)}${change}  _(${wins}W–${losses}L)_`;
   });
 
   // Chunk into pages of 20 to avoid embed limits
@@ -447,7 +487,7 @@ async function cmdTop(message) {
       .setColor(0xE5B25D)
       .setTitle(i === 0 ? '🏆 TTTIW Leaderboard' : '🏆 TTTIW Leaderboard (cont.)')
       .setDescription(chunks[i].join('\n'))
-      .setFooter(footer())
+      .setFooter({ text: 'TTTIW · Table Tennis Texas InventionWorks  ·  ↑↓ = rank change in last 3 days' })
       .setTimestamp();
     await message.reply({ embeds: [embed] });
   }
@@ -516,12 +556,12 @@ async function cmdVs(message, args) {
     .addFields(
       {
         name: p1.name,
-        value: [`Rating: **${r2(p1.rating)}** (RD ${r2(p1.rd)})`, `H2H wins: **${p1w}**`, `Win prob: **${winProb(p1, p2)}%**`].join('\n'),
+        value: [`Rating: **${rat(p1)}**`, `H2H wins: **${p1w}**`, `Win prob: **${winProb(p1, p2)}%**`].join('\n'),
         inline: true,
       },
       {
         name: p2.name,
-        value: [`Rating: **${r2(p2.rating)}** (RD ${r2(p2.rd)})`, `H2H wins: **${p2w}**`, `Win prob: **${winProb(p2, p1)}%**`].join('\n'),
+        value: [`Rating: **${rat(p2)}**`, `H2H wins: **${p2w}**`, `Win prob: **${winProb(p2, p1)}%**`].join('\n'),
         inline: true,
       },
       {
@@ -562,7 +602,7 @@ async function cmdRatingFarm(message, args) {
 
   const medals = ['🥇', '🥈', '🥉'];
   const lines = gains.map((g, i) =>
-    `${medals[i]} **${g.opp.name}** — **+${g.gain} elo** if you win  _(${g.prob}% chance)_\n\u3000Expected gain: **+${g.expected}** · Rating: ${r2(g.opp.rating)} · RD: ${r2(g.opp.rd)}`
+    `${medals[i]} **${g.opp.name}** — **+${g.gain} elo** if you win  _(${g.prob}% chance)_\n\u3000Expected gain: **+${g.expected}** · ${rat(g.opp)}`
   ).join('\n\n');
 
   const embed = new EmbedBuilder()
