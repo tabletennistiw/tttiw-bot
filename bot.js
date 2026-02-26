@@ -545,16 +545,19 @@ async function cmdRatingFarm(message, args) {
         { rating: player.rating, rd: player.rd, sigma: player.sigma || SIGMA_DEFAULT },
         [{ rating: opp.rating, rd: opp.rd, sigma: opp.sigma || SIGMA_DEFAULT, s: 1 }]
       );
-      return { opp, gain: Math.round((result.rating - player.rating) * 10) / 10, prob: winProb(player, opp) };
+      const gain = Math.round((result.rating - player.rating) * 10) / 10;
+      const prob = parseFloat(winProb(player, opp));
+      const expected = Math.round(gain * (prob / 100) * 10) / 10;
+      return { opp, gain, prob: prob.toFixed(1), expected };
     })
-    .sort((a, b) => b.gain - a.gain)
+    .sort((a, b) => b.expected - a.expected)
     .slice(0, 3);
 
   if (!gains.length) return message.reply('No other players found.');
 
   const medals = ['🥇', '🥈', '🥉'];
   const lines = gains.map((g, i) =>
-    `${medals[i]} **${g.opp.name}** — **+${g.gain} elo** if you win  _(${g.prob}% chance)_\n\u3000Rating: ${r2(g.opp.rating)} · RD: ${r2(g.opp.rd)}`
+    `${medals[i]} **${g.opp.name}** — **+${g.gain} elo** if you win  _(${g.prob}% chance)_\n\u3000Expected gain: **+${g.expected}** · Rating: ${r2(g.opp.rating)} · RD: ${r2(g.opp.rd)}`
   ).join('\n\n');
 
   const embed = new EmbedBuilder()
