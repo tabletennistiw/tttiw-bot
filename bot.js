@@ -338,7 +338,7 @@ async function cmdHelp(message) {
         ].join('\n'),
       },
       {
-        name: '🔥 Fun & Social',
+        name: '🎲 Random',
         value: [
           '`ttt streak` — longest current win streaks',
           '`ttt nemesis [player]` — who beats them the most',
