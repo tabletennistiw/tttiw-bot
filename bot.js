@@ -23,7 +23,8 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
 const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
-const CHANNEL_ID          = process.env.CHANNEL_ID || null;
+const CHANNEL_ID          = process.env.CHANNEL_ID ? process.env.CHANNEL_ID.split(',').map(s => s.trim()) : null;
+console.log('CHANNEL_ID raw:', process.env.CHANNEL_ID);
 const FIREBASE_PROJECT_ID = 'tttiw-6d44e';
 const PREFIX              = 'ttt';
 
@@ -766,11 +767,18 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
-client.once('ready', () => console.log(`✅ TTTIW bot ready as ${client.user.tag}`));
+client.once('clientReady', () => {
+  console.log(`✅ TTTIW bot ready as ${client.user.tag}`);
+  if (CHANNEL_ID) console.log(`📌 Watching channels: ${CHANNEL_ID.join(', ')}`);
+  else console.log('📌 Watching all channels');
+});
 
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
-  if (CHANNEL_ID && message.channelId !== CHANNEL_ID) return;
+  if (CHANNEL_ID && !CHANNEL_ID.includes(message.channelId)) {
+    console.log(`⏭ Ignored message in channel ${message.channelId} (not in allowed list: ${CHANNEL_ID.join(', ')})`);
+    return;
+  }
 
   const content = message.content.trim();
 
