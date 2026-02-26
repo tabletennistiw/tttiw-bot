@@ -326,6 +326,11 @@ async function cmdHelp(message) {
         inline: true,
       },
       {
+        name: '➕ Management',
+        value: '`ttt add [name]` — add a new player (rating starts at 1500)',
+        inline: true,
+      },
+      {
         name: '📊 Match Tools',
         value: [
           '`ttt predict [p1] [p2]` — win odds + elo outcomes',
@@ -688,6 +693,34 @@ async function cmdHot(message) {
   await message.reply({ embeds: [embed] });
 }
 
+// ── COMMAND: ttt add [player] ────────────────────────────────────────────────
+async function cmdAddPlayer(message, args) {
+  if (!args.length) return message.reply('Usage: `ttt add [name]`');
+  const name = args.join(' ').trim();
+
+  const existing = await findPlayer(name);
+  if (existing) return message.reply(`❌ **${existing.name}** already exists on the leaderboard.`);
+
+  await db.collection('players').add({
+    name,
+    rating: 1500,
+    rd: 120,
+    sigma: SIGMA_DEFAULT,
+    wins: 0,
+    losses: 0,
+    lastDecayAt: Date.now(),
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  const embed = new EmbedBuilder()
+    .setColor(0x7ec8a0)
+    .setTitle(`✅ Player Added`)
+    .setDescription(`**${name}** has joined the leaderboard with a starting rating of **1500**.`)
+    .setFooter(footer())
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
 // ── DISCORD CLIENT ────────────────────────────────────────────────────────────
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -722,6 +755,7 @@ client.on('messageCreate', async message => {
       if (cmd === 'nemesis')                      return await cmdNemesis(message, parts.slice(1));
       if (cmd === 'rivals')                       return await cmdRivals(message);
       if (cmd === 'hot')                          return await cmdHot(message);
+      if (cmd === 'add')                          return await cmdAddPlayer(message, parts.slice(1));
     } catch (err) {
       console.error('Command error:', err);
       return message.reply(`❌ Error: ${err.message}`);
