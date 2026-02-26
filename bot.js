@@ -304,10 +304,10 @@ async function cmdHelp(message) {
       {
         name: '📥 Reporting a Match',
         value: [
-          '`inoo ath` — no score',
-          '`inoo ath 10-8` — with dash',
-          '`inoo ath 10 8` — with space',
-          '`inoo 10 ath 8` — interleaved',
+          '`[winner] [loser]` — no score',
+          '`[winner] [loser] 10-8` — with dash',
+          '`[winner] [loser] 10 8` — with space',
+          '`[winner] 10 [loser] 8` — interleaved',
           '_First player is always the winner_',
         ].join('\n'),
       },
