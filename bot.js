@@ -101,7 +101,7 @@ function g2Update(player, opps) {
 function winProb(a, b) {
   const { mu, phi } = toG2(a.rating, a.rd);
   const { mu: muj, phi: phij } = toG2(b.rating, b.rd);
-  return (E(mu, muj, phij) * 100).toFixed(1);
+  return (E(mu, muj, Math.sqrt(phi * phi + phij * phij)) * 100).toFixed(1);
 }
 
 // ── MATCH PARSER ──────────────────────────────────────────────────────────────
