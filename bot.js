@@ -8,6 +8,7 @@
 //   ttt stats [player]
 //   ttt history [player]
 //   ttt rank [player]
+//   ttt rd [player]
 //   ttt top
 //   ttt predict [p1] [p2]
 //   ttt vs [p1] [p2]
@@ -38,46 +39,30 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 initializeApp({ credential: firebaseCredential, projectId: FIREBASE_PROJECT_ID });
 const db = getFirestore();
 
-// ── GLICKO-2 (must match index.html) ─────────────────────────────────────────
-const SCALE         = 173.7178;
-const SIGMA_DEFAULT = 0.06;
-const SIGMA_MAX     = 0.30;
-const TAU           = 1.2;
-const EPSILON       = 0.000001;
-const RD_MAX        = 200;
+// ── DECAY CONFIG (loaded from Firestore, updated via snapshot) ────────────────
+let DECAY_SCALE_MULTIPLIER  = 0;   // m in: rate = g * (1500/rating)^m
+let DECAY_GENERAL_MULTIPLIER = 1;  // g in: rate = g * (1500/rating)^m
+
+db.doc('config/decay').onSnapshot(snap => {
+  if (!snap.exists) return;
+  const d = snap.data();
+  if (d.decayScaleMult   != null) DECAY_SCALE_MULTIPLIER   = d.decayScaleMult;
+  if (d.decayGeneralMult != null) DECAY_GENERAL_MULTIPLIER = d.decayGeneralMult > 0 ? d.decayGeneralMult : 1;
+  console.log(`🔄 Decay config updated: g=${DECAY_GENERAL_MULTIPLIER} m=${DECAY_SCALE_MULTIPLIER}`);
+});
+
+// ── GLICKO-2 (simplified — matches index.html exactly, no sigma/volatility) ──
+const SCALE  = 173.7178;
+const RD_MAX = 200;
 
 function toG2(r, rd)      { return { mu: (r - 1500) / SCALE, phi: rd / SCALE }; }
 function fromG2(mu, phi)  { return { r: mu * SCALE + 1500, rd: phi * SCALE }; }
 function gPhi(phi)        { return 1 / Math.sqrt(1 + 3 * phi * phi / (Math.PI * Math.PI)); }
 function E(mu, muj, phij) { return 1 / (1 + Math.exp(-gPhi(phij) * (mu - muj))); }
 
-function computeNewSigma(sigma, phi, v, delta) {
-  const a = Math.log(sigma * sigma);
-  const tau2 = TAU * TAU, phi2 = phi * phi, delta2 = delta * delta;
-  const f = x => {
-    const ex = Math.exp(x), d2 = phi2 + v + ex;
-    return (ex * (delta2 - phi2 - v - ex)) / (2 * d2 * d2) - (x - a) / tau2;
-  };
-  let A = a, B = delta2 > phi2 + v ? Math.log(delta2 - phi2 - v) : (() => {
-    let k = 1; while (f(a - k * TAU) < 0) k++; return a - k * TAU;
-  })();
-  let fA = f(A), fB = f(B), itr = 0;
-  while (Math.abs(B - A) > EPSILON && itr < 500) {
-    const C = A + (A - B) * fA / (fB - fA), fC = f(C);
-    if (fC * fB <= 0) { A = B; fA = fB; } else { fA /= 2; }
-    B = C; fB = fC; itr++;
-  }
-  return Math.exp(A / 2);
-}
-
 function g2Update(player, opps) {
   const { mu, phi } = toG2(player.rating, player.rd);
-  const sigma = player.sigma || SIGMA_DEFAULT;
-  if (!opps.length) {
-    const phiStar = Math.sqrt(phi * phi + sigma * sigma);
-    const r = fromG2(mu, Math.min(phiStar, RD_MAX / SCALE));
-    return { rating: Math.round(r.r * 10) / 10, rd: Math.round(r.rd * 10) / 10, sigma };
-  }
+  if (!opps.length) return { rating: player.rating, rd: player.rd };
   let vInv = 0, deltaSum = 0;
   for (const o of opps) {
     const { mu: muj, phi: phij } = toG2(o.rating, o.rd);
@@ -85,23 +70,108 @@ function g2Update(player, opps) {
     vInv += gj * gj * ej * (1 - ej);
     deltaSum += gj * (o.s - ej);
   }
-  const v = 1 / vInv, delta = v * deltaSum;
-  const newSigma = computeNewSigma(sigma, phi, v, delta);
-  const phiStar = Math.sqrt(phi * phi + newSigma * newSigma);
-  const phiNew = 1 / Math.sqrt(1 / (phiStar * phiStar) + 1 / v);
-  const muNew = mu + phiNew * phiNew * deltaSum;
-  const r = fromG2(muNew, phiNew);
-  return {
-    rating: Math.round(r.r * 10) / 10,
-    rd:     Math.round(Math.min(r.rd, RD_MAX) * 10) / 10,
-    sigma:  Math.round(Math.min(newSigma, SIGMA_MAX) * 100000) / 100000,
-  };
+  const v      = 1 / vInv;
+  const phiNew = 1 / Math.sqrt(1 / (phi * phi) + 1 / v);
+  const muNew  = mu + phiNew * phiNew * deltaSum;
+  const r      = fromG2(muNew, phiNew);
+  return { rating: r.r, rd: Math.min(r.rd, RD_MAX) };
 }
 
 function winProb(a, b) {
-  const { mu, phi } = toG2(a.rating, a.rd);
+  const { mu, phi }        = toG2(a.rating, a.rd);
   const { mu: muj, phi: phij } = toG2(b.rating, b.rd);
   return (E(mu, muj, Math.sqrt(phi * phi + phij * phij)) * 100).toFixed(1);
+}
+
+// ── RD ANCHOR SYSTEM (integer-second, mirrors index.html exactly) ─────────────
+//
+//   Each player doc has:
+//     rdAnchorRD  — the RD value at the anchor moment
+//     rdAnchorSec — integer Unix seconds when the anchor was set
+//
+//   Live RD = rdAfterSec(rdAnchorRD, rating, floor(now/1000) - rdAnchorSec)
+//   Integer seconds only — no float drift between bot and site.
+//
+const _RD_NUMERATOR       = 30240000;
+const _RD_ASYMPTOTE_SHIFT = 336000;
+const _RD_ASYMPTOTE       = 120;
+const _RD_MIN             = 30;
+const _RD_MAX_NEW         = 120;
+
+function _rdClamp(rd) { return Math.min(_RD_MAX_NEW, Math.max(_RD_MIN, rd == null ? 120 : rd)); }
+
+// Decay rate = g * (1500/rating)^m
+function _rdRatingScale(rating) {
+  const m = DECAY_SCALE_MULTIPLIER;
+  const g = DECAY_GENERAL_MULTIPLIER > 0 ? DECAY_GENERAL_MULTIPLIER : 1;
+  const ratingScale = (!m || m <= 0) ? 1 : Math.pow(1500 / Math.max(1, rating || 1500), m);
+  return g * ratingScale;
+}
+
+function _rdToX(rd) {
+  if (rd >= _RD_ASYMPTOTE) return Infinity;
+  const d = rd - _RD_ASYMPTOTE;
+  return -_RD_NUMERATOR / d - _RD_ASYMPTOTE_SHIFT;
+}
+
+function _rdFromX(x) {
+  const rd = -_RD_NUMERATOR / (x + _RD_ASYMPTOTE_SHIFT) + _RD_ASYMPTOTE;
+  return _rdClamp(rd);
+}
+
+// Given anchor RD + rating, return RD after N whole seconds of decay
+function _rdAfterSec(anchorRD, rating, elapsedWholeSec) {
+  const clamped = _rdClamp(anchorRD);
+  const x0 = _rdToX(clamped);
+  if (!isFinite(x0)) return _RD_MAX_NEW;
+  const xNow = x0 + Math.max(0, Math.floor(elapsedWholeSec)) * _rdRatingScale(rating || 1500);
+  return _rdFromX(xNow);
+}
+
+// Read anchor from a player object — supports new fields with fallback to old rdBaseTime
+function _rdGetAnchor(p) {
+  if (p.rdAnchorSec != null) {
+    return { rd: _rdClamp(p.rdAnchorRD ?? p.rd ?? 120), sec: p.rdAnchorSec };
+  }
+  // Fallback: old rdBaseTime field
+  let ms = Date.now();
+  const t = p.rdBaseTime;
+  if (t != null) {
+    if (typeof t === 'number')               ms = t > 2e10 ? t : t * 1000;
+    else if (typeof t.toMillis === 'function') ms = t.toMillis();
+    else if (typeof t.toDate   === 'function') ms = t.toDate().getTime();
+    else ms = Number(t) || Date.now();
+  }
+  return { rd: _rdClamp(p.rd ?? 120), sec: Math.round(ms / 1000) };
+}
+
+// Build anchor fields for writing to Firestore
+function _rdNewAnchor(rd, nowMs) {
+  return { rdAnchorRD: _rdClamp(rd), rdAnchorSec: Math.round((nowMs || Date.now()) / 1000) };
+}
+
+// THE live RD function — matches _computeRDLive in index.html exactly
+function computeRDLive(p) {
+  if (p.decayImmune) return _rdClamp(p.rdAnchorRD ?? p.rd ?? 120);
+  const { rd: anchorRD, sec: anchorSec } = _rdGetAnchor(p);
+  const nowSec = Math.floor(Date.now() / 1000);
+  return _rdAfterSec(anchorRD, p.rating || 1500, nowSec - anchorSec);
+}
+
+// Seconds until a player's RD hits 100 (purge threshold)
+function _secsToPurge(p) {
+  const lrd = computeRDLive(p);
+  if (lrd >= 100) return 0;
+  const { rd: anchorRD, sec: anchorSec } = _rdGetAnchor(p);
+  const nowSec    = Math.floor(Date.now() / 1000);
+  const elapsedNow = nowSec - anchorSec;
+  // binary-search for the second where rd crosses 100
+  const x0     = _rdToX(_rdClamp(anchorRD));
+  const x100   = _rdToX(100);
+  const scale  = _rdRatingScale(p.rating || 1500);
+  if (!isFinite(x0) || scale <= 0) return Infinity;
+  const extraSec = Math.ceil((x100 - x0) / scale) - elapsedNow;
+  return Math.max(0, extraSec);
 }
 
 // ── MATCH PARSER ──────────────────────────────────────────────────────────────
@@ -133,7 +203,20 @@ function rankEmoji(rank) {
 }
 
 function footer() { return { text: 'TTTIW · Table Tennis Texas InventionWorks' }; }
-function rat(p) { return `${r2(p.rating)} ±${r2(p.rd)}`; }
+
+// Show live-computed RD so it matches the website
+function rat(p) { return `${r2(p.rating)} ±${r2(computeRDLive(p))}`; }
+
+function fmtDuration(ms) {
+  if (!ms || ms <= 0) return '—';
+  const d = Math.floor(ms / 864e5);
+  const h = Math.floor((ms % 864e5) / 36e5);
+  const m = Math.floor((ms % 36e5)  / 6e4);
+  const s = Math.floor((ms % 6e4)   / 1e3);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
+}
 
 async function getAllPlayers() {
   const snap = await db.collection('players').get();
@@ -147,16 +230,17 @@ async function getAllMatches() {
 
 async function findPlayer(nameOrMention) {
   const stripped = nameOrMention.replace(/^<@!?(\d+)>$/, '$1');
-  const players = await getAllPlayers();
+  const players  = await getAllPlayers();
   return players.find(p =>
     p.name?.toLowerCase() === stripped.toLowerCase() ||
     p.discordId === stripped
   ) || null;
 }
 
+// Uses live RD to determine leaderboard visibility — matches site behaviour
 async function getLeaderboard() {
   const players = await getAllPlayers();
-  return players.filter(p => p.rd <= 100).sort((a, b) => b.rating - a.rating);
+  return players.filter(p => computeRDLive(p) <= 100).sort((a, b) => b.rating - a.rating);
 }
 
 function calcStreak(pid, matchesSortedDesc) {
@@ -180,29 +264,39 @@ async function submitMatch(winner, loser, scoreStr) {
 
     const w = ws.data(), l = ls.data();
 
-    const uw = g2Update(
-      { rating: w.rating, rd: w.rd, sigma: w.sigma || SIGMA_DEFAULT },
-      [{ rating: l.rating, rd: l.rd, sigma: l.sigma || SIGMA_DEFAULT, s: 1 }]
-    );
-    const ul = g2Update(
-      { rating: l.rating, rd: l.rd, sigma: l.sigma || SIGMA_DEFAULT },
-      [{ rating: w.rating, rd: w.rd, sigma: w.sigma || SIGMA_DEFAULT, s: 0 }]
-    );
+    // Use live RD at match time — integer-second calc, same as the site
+    const wLiveRd = computeRDLive({ ...w, id: winner.id });
+    const lLiveRd = computeRDLive({ ...l, id: loser.id });
 
-    const now = Date.now();
-    const allSnap = await db.collection('players').get();
-    const allP = allSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-    const ranked = p => p.rd <= 100;
+    const uw = g2Update({ rating: w.rating, rd: wLiveRd }, [{ rating: l.rating, rd: lLiveRd, s: 1 }]);
+    const ul = g2Update({ rating: l.rating, rd: lLiveRd }, [{ rating: w.rating, rd: wLiveRd, s: 0 }]);
+
+    const now    = Date.now();
+    // Anchor second = nearest whole second of match time (mirrors site's Math.round)
+    const wAnchor = _rdNewAnchor(uw.rd, now);
+    const lAnchor = _rdNewAnchor(ul.rd, now);
+
+    const allSnap  = await db.collection('players').get();
+    const allP     = allSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const ranked   = p => computeRDLive(p) <= 100;
     const topBefore = allP.filter(ranked).sort((a, b) => b.rating - a.rating)[0];
-    const simP = allP.map(p => {
-      if (p.id === winner.id) return { ...p, rating: uw.rating, rd: uw.rd };
-      if (p.id === loser.id)  return { ...p, rating: ul.rating, rd: ul.rd };
+    const simP     = allP.map(p => {
+      if (p.id === winner.id) return { ...p, rating: uw.rating, rd: uw.rd, rdAnchorRD: wAnchor.rdAnchorRD, rdAnchorSec: wAnchor.rdAnchorSec };
+      if (p.id === loser.id)  return { ...p, rating: ul.rating, rd: ul.rd, rdAnchorRD: lAnchor.rdAnchorRD, rdAnchorSec: lAnchor.rdAnchorSec };
       return p;
     });
     const topAfter = simP.filter(ranked).sort((a, b) => b.rating - a.rating)[0];
 
-    const wUpdate = { rating: uw.rating, rd: uw.rd, sigma: uw.sigma, wins: (w.wins || 0) + 1, lastMatchAt: now };
-    const lUpdate = { rating: ul.rating, rd: ul.rd, sigma: ul.sigma, losses: (l.losses || 0) + 1, lastMatchAt: now };
+    const wUpdate = {
+      rating: uw.rating, rd: uw.rd,
+      rdAnchorRD: wAnchor.rdAnchorRD, rdAnchorSec: wAnchor.rdAnchorSec,
+      wins: (w.wins || 0) + 1,
+    };
+    const lUpdate = {
+      rating: ul.rating, rd: ul.rd,
+      rdAnchorRD: lAnchor.rdAnchorRD, rdAnchorSec: lAnchor.rdAnchorSec,
+      losses: (l.losses || 0) + 1,
+    };
 
     if (topBefore?.id !== topAfter?.id) {
       if (topBefore) {
@@ -211,58 +305,63 @@ async function submitMatch(winner, loser, scoreStr) {
           const dur = now - (oldTop.no1Since || now);
           const upd = { no1Since: null };
           if (dur > (oldTop.longestNo1Ms || 0)) upd.longestNo1Ms = dur;
-          if (oldTop.id === winner.id) Object.assign(wUpdate, upd);
-          else if (oldTop.id === loser.id) Object.assign(lUpdate, upd);
+          if (oldTop.id === winner.id)      Object.assign(wUpdate, upd);
+          else if (oldTop.id === loser.id)  Object.assign(lUpdate, upd);
           else await tx.update(db.collection('players').doc(oldTop.id), upd);
         }
       }
       if (topAfter) {
         const newTopData = allP.find(p => p.id === topAfter.id);
         const no1Since = newTopData?.no1Since || now;
-        if (topAfter.id === winner.id) wUpdate.no1Since = no1Since;
+        if (topAfter.id === winner.id)     wUpdate.no1Since = no1Since;
         else if (topAfter.id === loser.id) lUpdate.no1Since = no1Since;
         else await tx.update(db.collection('players').doc(topAfter.id), { no1Since });
       }
     }
 
     tx.update(db.collection('players').doc(winner.id), wUpdate);
-    tx.update(db.collection('players').doc(loser.id), lUpdate);
+    tx.update(db.collection('players').doc(loser.id),  lUpdate);
 
     const matchRef = db.collection('matches').doc();
     tx.set(matchRef, {
       winnerId: winner.id, loserId: loser.id,
-      winnerName: w.name, loserName: l.name,
+      winnerName: w.name,  loserName: l.name,
       p1id: winner.id, p2id: loser.id,
-      p1name: w.name, p2name: l.name,
+      p1name: w.name,  p2name: l.name,
       score: 1, matchScore: scoreStr || null,
       p1delta: Math.round((uw.rating - w.rating) * 10) / 10,
       p2delta: Math.round((ul.rating - l.rating) * 10) / 10,
-      p1newRD: uw.rd, p2newRD: ul.rd,
-      p1newSigma: uw.sigma, p2newSigma: ul.sigma,
+      p1oldRD: wLiveRd, p2oldRD: lLiveRd,
+      p1newRD: uw.rd,   p2newRD: ul.rd,
       p1oldRating: w.rating, p1newRating: uw.rating,
       p2oldRating: l.rating, p2newRating: ul.rating,
       source: 'discord',
       date: FieldValue.serverTimestamp(),
     });
 
-    return { w, l, uw, ul, topBefore, topAfter, no1Change: topBefore?.id !== topAfter?.id };
+    return { w, l, uw, ul, wLiveRd, lLiveRd, topBefore, topAfter, no1Change: topBefore?.id !== topAfter?.id };
   });
 }
 
 // ── MATCH RESULT EMBED ────────────────────────────────────────────────────────
 async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
-  const { w, l, uw, ul, no1Change, topAfter } = result;
+  const { w, l, uw, ul, wLiveRd, lLiveRd, no1Change, topAfter } = result;
   const wDelta = Math.round((uw.rating - w.rating) * 10) / 10;
   const lDelta = Math.round((ul.rating - l.rating) * 10) / 10;
 
-  const lb = await getLeaderboard();
+  const lb    = await getLeaderboard();
   const wRank = lb.findIndex(p => p.id === winnerData.id) + 1;
   const lRank = lb.findIndex(p => p.id === loserData.id) + 1;
 
   const top5 = lb.slice(0, 5).map((p, i) => {
-    const tag = p.id === winnerData.id ? ' <- W' : p.id === loserData.id ? ' <- L' : '';
+    const tag = p.id === winnerData.id ? ' ← W' : p.id === loserData.id ? ' ← L' : '';
     return `${rankEmoji(i + 1)} **${p.name}** — ${rat(p)}${tag}`;
   }).join('\n');
+
+  const rdLine = (liveRd, newRd) => {
+    const delta = Math.round((newRd - liveRd) * 10) / 10;
+    return `RD: ±${r2(liveRd)} → ±${r2(newRd)} (${signed(delta)})`;
+  };
 
   const embed = new EmbedBuilder()
     .setColor(0xE5B25D)
@@ -271,19 +370,21 @@ async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
       {
         name: `🏆 ${w.name}`,
         value: [
-          `${rat(w)} → **${rat(uw)}** (${signed(wDelta)})`,
+          `${r2(w.rating)} → **${r2(uw.rating)}** (${signed(wDelta)})`,
+          rdLine(wLiveRd, uw.rd),
           `Record: ${(w.wins || 0) + 1}W – ${w.losses || 0}L`,
-          wRank ? `Rank: ${rankEmoji(wRank)}` : '',
-        ].filter(Boolean).join('\n'),
+          wRank ? `Rank: ${rankEmoji(wRank)}` : '_Unranked_',
+        ].join('\n'),
         inline: true,
       },
       {
         name: `😔 ${l.name}`,
         value: [
-          `${rat(l)} → **${rat(ul)}** (${signed(lDelta)})`,
+          `${r2(l.rating)} → **${r2(ul.rating)}** (${signed(lDelta)})`,
+          rdLine(lLiveRd, ul.rd),
           `Record: ${l.wins || 0}W – ${(l.losses || 0) + 1}L`,
-          lRank ? `Rank: ${rankEmoji(lRank)}` : '',
-        ].filter(Boolean).join('\n'),
+          lRank ? `Rank: ${rankEmoji(lRank)}` : '_Unranked_',
+        ].join('\n'),
         inline: true,
       },
       { name: '📊 Top 5 Standings', value: top5 || '_No ranked players yet_' }
@@ -317,6 +418,7 @@ async function cmdHelp(message) {
           '`ttt stats [player]` — full profile',
           '`ttt history [player]` — last 5 matches',
           '`ttt rank [player]` — current rank & rating',
+          '`ttt rd [player]` — live RD & time until purge',
         ].join('\n'),
         inline: true,
       },
@@ -327,24 +429,24 @@ async function cmdHelp(message) {
       },
       {
         name: '➕ Management',
-        value: '`ttt add [name]` — add a new player (rating starts at 1500)',
+        value: '`ttt add [name]` — add a new player',
         inline: true,
       },
       {
         name: '📊 Match Tools',
         value: [
-          '`ttt predict [p1] [p2]` — win odds + elo outcomes',
+          '`ttt predict [p1] [p2]` — win odds + rating outcomes',
           '`ttt vs [p1] [p2]` — head-to-head record',
-          '`ttt rating farm [player]` — best targets for elo gain',
+          '`ttt rating farm [player]` — best targets for rating gain',
         ].join('\n'),
       },
       {
-        name: '🎲 Random',
+        name: '🎲 Fun Stats',
         value: [
           '`ttt streak` — longest current win streaks',
           '`ttt nemesis [player]` — who beats them the most',
           '`ttt rivals` — most played matchups',
-          '`ttt hot` — most elo gained this week',
+          '`ttt hot` — most rating gained this week',
         ].join('\n'),
       }
     )
@@ -358,25 +460,34 @@ async function cmdStats(message, args) {
   const player = await findPlayer(args[0]);
   if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
 
-  const matches = await getAllMatches();
+  const matches  = await getAllMatches();
   const myMatches = matches.filter(m => m.winnerId === player.id || m.loserId === player.id);
-  const wins = myMatches.filter(m => m.winnerId === player.id).length;
-  const losses = myMatches.filter(m => m.loserId === player.id).length;
-  const streak = calcStreak(player.id, myMatches);
+  const wins     = myMatches.filter(m => m.winnerId === player.id).length;
+  const losses   = myMatches.filter(m => m.loserId  === player.id).length;
+  const streak   = calcStreak(player.id, myMatches);
+  const liveRd   = computeRDLive(player);
 
-  const lb = await getLeaderboard();
+  const lb   = await getLeaderboard();
   const rank = lb.findIndex(p => p.id === player.id) + 1;
+
+  const secsToPurge = _secsToPurge(player);
+  const rdStatus = liveRd > 100
+    ? '⚠️ Hidden (RD > 100)'
+    : secsToPurge < 3600
+      ? `⚠️ Purge in ${fmtDuration(secsToPurge * 1000)}`
+      : `✅ Active (purge in ${fmtDuration(secsToPurge * 1000)})`;
 
   const embed = new EmbedBuilder()
     .setColor(0xE5B25D)
     .setTitle(`👤 ${player.name}`)
     .addFields(
-      { name: 'Rating',   value: `**${rat(player)}**`, inline: true },
-      { name: 'Rank',     value: rank ? rankEmoji(rank) : '_Unranked_',             inline: true },
-      { name: 'Record',   value: `${wins}W – ${losses}L`,                           inline: true },
-      { name: 'Win Rate', value: pct(wins, wins + losses),                          inline: true },
-      { name: 'Matches',  value: String(wins + losses),                             inline: true },
-      { name: 'Streak',   value: streak > 0 ? `🔥 ${streak} wins` : '—',           inline: true },
+      { name: 'Rating',   value: `**${r2(player.rating)}**`,                     inline: true },
+      { name: 'RD',       value: `**±${r2(liveRd)}**`,                           inline: true },
+      { name: 'Rank',     value: rank ? rankEmoji(rank) : '_Unranked_',          inline: true },
+      { name: 'Record',   value: `${wins}W – ${losses}L`,                        inline: true },
+      { name: 'Win Rate', value: pct(wins, wins + losses),                       inline: true },
+      { name: 'Streak',   value: streak > 0 ? `🔥 ${streak} wins` : '—',        inline: true },
+      { name: 'RD Status', value: rdStatus },
     )
     .setFooter(footer())
     .setTimestamp();
@@ -389,7 +500,7 @@ async function cmdHistory(message, args) {
   const player = await findPlayer(args[0]);
   if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
 
-  const matches = await getAllMatches();
+  const matches  = await getAllMatches();
   const myMatches = matches
     .filter(m => m.winnerId === player.id || m.loserId === player.id)
     .slice(0, 5);
@@ -397,12 +508,12 @@ async function cmdHistory(message, args) {
   if (!myMatches.length) return message.reply(`No matches found for **${player.name}**.`);
 
   const lines = myMatches.map(m => {
-    const won = m.winnerId === player.id;
-    const opp = won ? m.loserName : m.winnerName;
+    const won   = m.winnerId === player.id;
+    const opp   = won ? m.loserName : m.winnerName;
     const delta = won ? m.p1delta : m.p2delta;
     const score = m.matchScore ? ` ${m.matchScore}` : '';
-    const ts = m.date?.toDate ? m.date.toDate() : new Date(m.date);
-    const date = ts.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    const ts    = m.date?.toDate ? m.date.toDate() : new Date(m.date);
+    const date  = ts.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     return `${won ? '✅' : '❌'} **${won ? 'W' : 'L'}** vs ${opp}${score}  (${signed(delta)})  · ${date}`;
   }).join('\n');
 
@@ -421,11 +532,56 @@ async function cmdRank(message, args) {
   const player = await findPlayer(args[0]);
   if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
 
-  const lb = await getLeaderboard();
-  const rank = lb.findIndex(p => p.id === player.id) + 1;
+  const liveRd = computeRDLive(player);
+  const lb     = await getLeaderboard();
+  const rank   = lb.findIndex(p => p.id === player.id) + 1;
 
-  if (!rank) return message.reply(`**${player.name}** is currently unranked (RD too high).`);
-  await message.reply(`${rankEmoji(rank)} **${player.name}** is ranked **#${rank}** with a rating of **${rat(player)}**`);
+  if (!rank) return message.reply(`**${player.name}** is currently unranked (RD ±${r2(liveRd)} > 100 — play more games!).`);
+  await message.reply(`${rankEmoji(rank)} **${player.name}** is ranked **#${rank}** · ${r2(player.rating)} ±${r2(liveRd)} RD`);
+}
+
+// ── COMMAND: ttt rd [player] ──────────────────────────────────────────────────
+async function cmdRD(message, args) {
+  if (!args.length) return message.reply('Usage: `ttt rd [player]`');
+  const player = await findPlayer(args[0]);
+  if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
+
+  const liveRd = computeRDLive(player);
+  const { sec: anchorSec } = _rdGetAnchor(player);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const elapsedSec = nowSec - anchorSec;
+
+  const isHidden = liveRd > 100;
+  const secsToPurge = _secsToPurge(player);
+
+  let statusLine;
+  if (player.decayImmune) {
+    statusLine = '🛡️ Decay immune — RD frozen';
+  } else if (isHidden) {
+    statusLine = '⚠️ Currently **hidden** from leaderboard (RD > 100) — play a match to get back on!';
+  } else {
+    statusLine = secsToPurge < 3600
+      ? `⚠️ **Purge in ${fmtDuration(secsToPurge * 1000)}** — play a match to reset!`
+      : `✅ On leaderboard · purge in **${fmtDuration(secsToPurge * 1000)}**`;
+  }
+
+  const g = DECAY_GENERAL_MULTIPLIER > 0 ? DECAY_GENERAL_MULTIPLIER : 1;
+  const m = DECAY_SCALE_MULTIPLIER;
+  const currentRate = (g * ((!m || m <= 0) ? 1 : Math.pow(1500 / Math.max(1, player.rating || 1500), m))).toFixed(3);
+
+  const embed = new EmbedBuilder()
+    .setColor(isHidden ? 0xd9534f : liveRd > 80 ? 0xE5B25D : 0x7ec8a0)
+    .setTitle(`📡 RD Status — ${player.name}`)
+    .addFields(
+      { name: 'Live RD',       value: `**±${r2(liveRd)}**`,                    inline: true },
+      { name: 'Rating',        value: `**${r2(player.rating)}**`,              inline: true },
+      { name: 'Decay Rate',    value: `**${currentRate}×** (g=${g}, m=${m})`, inline: true },
+      { name: 'Anchor age',    value: fmtDuration(elapsedSec * 1000),         inline: true },
+      { name: 'Status',        value: statusLine },
+    )
+    .setFooter(footer())
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
 }
 
 // ── COMMAND: ttt top ──────────────────────────────────────────────────────────
@@ -435,51 +591,38 @@ async function cmdTop(message) {
 
   const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
 
-  // For each player, rewind their rating to 3 days ago by undoing recent matches
-  // We do this by finding their rating before their oldest recent match
+  // Find each player's rating before their oldest recent match (for rank-change arrows)
   const oldRatingMap = {};
   for (const p of lb) {
     const recentMatches = allMatches.filter(m => {
       const ts = m.date?.toDate ? m.date.toDate().getTime() : new Date(m.date).getTime();
       return ts >= cutoff && (m.winnerId === p.id || m.loserId === p.id);
     });
-    if (!recentMatches.length) {
-      oldRatingMap[p.id] = p.rating; // no change
-      continue;
-    }
-    // Find rating before the earliest recent match by using oldRating stored on the match
-    const earliest = recentMatches[recentMatches.length - 1]; // matches are desc
-    if (earliest.winnerId === p.id) {
-      oldRatingMap[p.id] = earliest.p1oldRating ?? p.rating;
-    } else {
-      oldRatingMap[p.id] = earliest.p2oldRating ?? p.rating;
-    }
+    if (!recentMatches.length) { oldRatingMap[p.id] = p.rating; continue; }
+    const earliest = recentMatches[recentMatches.length - 1];
+    oldRatingMap[p.id] = earliest.winnerId === p.id
+      ? (earliest.p1oldRating ?? p.rating)
+      : (earliest.p2oldRating ?? p.rating);
   }
 
-  // Build old leaderboard snapshot using old ratings
   const oldLb = lb
     .map(p => ({ ...p, rating: oldRatingMap[p.id] ?? p.rating }))
-    .filter(p => p.rd <= 100)
+    .filter(p => computeRDLive(p) <= 100)
     .sort((a, b) => b.rating - a.rating);
-
   const oldRankMap = {};
   oldLb.forEach((p, i) => { oldRankMap[p.id] = i + 1; });
 
   const lines = lb.map((p, i) => {
     const currentRank = i + 1;
-    const oldRank = oldRankMap[p.id];
-    const wins = p.wins || 0, losses = p.losses || 0;
-
+    const oldRank     = oldRankMap[p.id];
     let change = '';
     if (oldRank && oldRank !== currentRank) {
-      const diff = oldRank - currentRank; // positive = moved up
+      const diff = oldRank - currentRank;
       change = diff > 0 ? ` ↑${diff}` : ` ↓${Math.abs(diff)}`;
     }
-
-    return `${rankEmoji(currentRank)} **${p.name}** — ${rat(p)}${change}  _(${wins}W–${losses}L)_`;
+    return `${rankEmoji(currentRank)} **${p.name}** — ${rat(p)}${change}  _(${p.wins || 0}W–${p.losses || 0}L)_`;
   });
 
-  // Chunk into pages of 20 to avoid embed limits
   const chunks = [];
   for (let i = 0; i < lines.length; i += 20) chunks.push(lines.slice(i, i + 20));
 
@@ -502,21 +645,32 @@ async function cmdPredict(message, args) {
   if (!p2) return message.reply(`❌ Player not found: **${args[1]}**`);
   if (p1.id === p2.id) return message.reply(`❌ That's the same person!`);
 
-  const p1WinPct = winProb(p1, p2);
+  // Use live RD for predictions so they match what the site would show
+  const p1rd = computeRDLive(p1);
+  const p2rd = computeRDLive(p2);
+  const p1Live = { ...p1, rd: p1rd };
+  const p2Live = { ...p2, rd: p2rd };
+
+  const p1WinPct = winProb(p1Live, p2Live);
   const p2WinPct = (100 - parseFloat(p1WinPct)).toFixed(1);
 
-  const ifP1Wins_p1 = g2Update({ rating: p1.rating, rd: p1.rd, sigma: p1.sigma || SIGMA_DEFAULT }, [{ rating: p2.rating, rd: p2.rd, sigma: p2.sigma || SIGMA_DEFAULT, s: 1 }]);
-  const ifP1Wins_p2 = g2Update({ rating: p2.rating, rd: p2.rd, sigma: p2.sigma || SIGMA_DEFAULT }, [{ rating: p1.rating, rd: p1.rd, sigma: p1.sigma || SIGMA_DEFAULT, s: 0 }]);
-  const ifP2Wins_p2 = g2Update({ rating: p2.rating, rd: p2.rd, sigma: p2.sigma || SIGMA_DEFAULT }, [{ rating: p1.rating, rd: p1.rd, sigma: p1.sigma || SIGMA_DEFAULT, s: 1 }]);
-  const ifP2Wins_p1 = g2Update({ rating: p1.rating, rd: p1.rd, sigma: p1.sigma || SIGMA_DEFAULT }, [{ rating: p2.rating, rd: p2.rd, sigma: p2.sigma || SIGMA_DEFAULT, s: 0 }]);
+  const ifP1Wins_p1 = g2Update({ rating: p1.rating, rd: p1rd }, [{ rating: p2.rating, rd: p2rd, s: 1 }]);
+  const ifP1Wins_p2 = g2Update({ rating: p2.rating, rd: p2rd }, [{ rating: p1.rating, rd: p1rd, s: 0 }]);
+  const ifP2Wins_p2 = g2Update({ rating: p2.rating, rd: p2rd }, [{ rating: p1.rating, rd: p1rd, s: 1 }]);
+  const ifP2Wins_p1 = g2Update({ rating: p1.rating, rd: p1rd }, [{ rating: p2.rating, rd: p2rd, s: 0 }]);
 
   const embed = new EmbedBuilder()
     .setColor(0xc9a0dc)
     .setTitle(`🔮 ${p1.name} vs ${p2.name}`)
     .addFields(
       {
+        name: 'Current Ratings',
+        value: `**${p1.name}**: ${r2(p1.rating)} ±${r2(p1rd)}\n**${p2.name}**: ${r2(p2.rating)} ±${r2(p2rd)}`,
+      },
+      {
         name: 'Win Probability',
         value: `**${p1.name}**: ${p1WinPct}%\n**${p2.name}**: ${p2WinPct}%`,
+        inline: true,
       },
       {
         name: `If ${p1.name} wins`,
@@ -542,13 +696,16 @@ async function cmdVs(message, args) {
   if (!p2) return message.reply(`❌ Player not found: **${args[1]}**`);
   if (p1.id === p2.id) return message.reply(`❌ That's the same person!`);
 
+  const p1rd = computeRDLive(p1), p2rd = computeRDLive(p2);
+  const p1Live = { ...p1, rd: p1rd }, p2Live = { ...p2, rd: p2rd };
+
   const matches = await getAllMatches();
-  const h2h = matches.filter(m =>
+  const h2h   = matches.filter(m =>
     (m.winnerId === p1.id && m.loserId === p2.id) ||
     (m.winnerId === p2.id && m.loserId === p1.id)
   );
-  const p1w = h2h.filter(m => m.winnerId === p1.id).length;
-  const p2w = h2h.filter(m => m.winnerId === p2.id).length;
+  const p1w   = h2h.filter(m => m.winnerId === p1.id).length;
+  const p2w   = h2h.filter(m => m.winnerId === p2.id).length;
   const total = h2h.length;
 
   const embed = new EmbedBuilder()
@@ -557,12 +714,12 @@ async function cmdVs(message, args) {
     .addFields(
       {
         name: p1.name,
-        value: [`Rating: **${rat(p1)}**`, `H2H wins: **${p1w}**`, `Win prob: **${winProb(p1, p2)}%**`].join('\n'),
+        value: [`Rating: **${rat(p1Live)}**`, `H2H wins: **${p1w}**`, `Win prob: **${winProb(p1Live, p2Live)}%**`].join('\n'),
         inline: true,
       },
       {
         name: p2.name,
-        value: [`Rating: **${rat(p2)}**`, `H2H wins: **${p2w}**`, `Win prob: **${winProb(p2, p1)}%**`].join('\n'),
+        value: [`Rating: **${rat(p2Live)}**`, `H2H wins: **${p2w}**`, `Win prob: **${winProb(p2Live, p1Live)}%**`].join('\n'),
         inline: true,
       },
       {
@@ -584,17 +741,17 @@ async function cmdRatingFarm(message, args) {
   if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
 
   const allPlayers = await getAllPlayers();
+  const playerRd   = computeRDLive(player);
+
   const gains = allPlayers
     .filter(p => p.id !== player.id)
     .map(opp => {
-      const result = g2Update(
-        { rating: player.rating, rd: player.rd, sigma: player.sigma || SIGMA_DEFAULT },
-        [{ rating: opp.rating, rd: opp.rd, sigma: opp.sigma || SIGMA_DEFAULT, s: 1 }]
-      );
-      const gain = Math.round((result.rating - player.rating) * 10) / 10;
-      const prob = parseFloat(winProb(player, opp));
+      const oppRd   = computeRDLive(opp);
+      const result  = g2Update({ rating: player.rating, rd: playerRd }, [{ rating: opp.rating, rd: oppRd, s: 1 }]);
+      const gain    = Math.round((result.rating - player.rating) * 10) / 10;
+      const prob    = parseFloat(winProb({ ...player, rd: playerRd }, { ...opp, rd: oppRd }));
       const expected = Math.round(gain * (prob / 100) * 10) / 10;
-      return { opp, gain, prob: prob.toFixed(1), expected };
+      return { opp, oppRd, gain, prob: prob.toFixed(1), expected };
     })
     .sort((a, b) => b.expected - a.expected)
     .slice(0, 3);
@@ -602,8 +759,8 @@ async function cmdRatingFarm(message, args) {
   if (!gains.length) return message.reply('No other players found.');
 
   const medals = ['🥇', '🥈', '🥉'];
-  const lines = gains.map((g, i) =>
-    `${medals[i]} **${g.opp.name}** — **+${g.gain} elo** if you win  _(${g.prob}% chance)_\n\u3000Expected gain: **+${g.expected}** · ${rat(g.opp)}`
+  const lines  = gains.map((g, i) =>
+    `${medals[i]} **${g.opp.name}** — **+${g.gain} pts** if you win  _(${g.prob}% chance)_\n\u3000Expected gain: **+${g.expected}** · ${r2(g.opp.rating)} ±${r2(g.oppRd)} RD`
   ).join('\n\n');
 
   const embed = new EmbedBuilder()
@@ -650,14 +807,14 @@ async function cmdNemesis(message, args) {
   if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
 
   const matches = await getAllMatches();
-  const losses = matches.filter(m => m.loserId === player.id);
+  const losses  = matches.filter(m => m.loserId === player.id);
   if (!losses.length) return message.reply(`**${player.name}** has never lost a match. Unbeatable! 🐐`);
 
   const beatCount = {};
   for (const m of losses) beatCount[m.winnerName] = (beatCount[m.winnerName] || 0) + 1;
 
   const sorted = Object.entries(beatCount).sort((a, b) => b[1] - a[1]);
-  const lines = sorted.slice(0, 5).map(([name, count], i) =>
+  const lines  = sorted.slice(0, 5).map(([name, count], i) =>
     `${rankEmoji(i + 1)} **${name}** — beaten them **${count}** time${count !== 1 ? 's' : ''}`
   ).join('\n');
 
@@ -672,8 +829,7 @@ async function cmdNemesis(message, args) {
 
 // ── COMMAND: ttt rivals ───────────────────────────────────────────────────────
 async function cmdRivals(message) {
-  const matches = await getAllMatches();
-
+  const matches   = await getAllMatches();
   const pairCount = {};
   for (const m of matches) {
     if (!m.winnerId || !m.loserId) continue;
@@ -705,7 +861,7 @@ async function cmdRivals(message) {
 // ── COMMAND: ttt hot ──────────────────────────────────────────────────────────
 async function cmdHot(message) {
   const matches = await getAllMatches();
-  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const cutoff  = Date.now() - 7 * 24 * 60 * 60 * 1000;
 
   const recent = matches.filter(m => {
     const ts = m.date?.toDate ? m.date.toDate().getTime() : new Date(m.date).getTime();
@@ -716,13 +872,13 @@ async function cmdHot(message) {
 
   const gains = {};
   for (const m of recent) {
-    if (m.winnerName) gains[m.winnerName] = (gains[m.winnerName] || 0) + (m.p1delta || 0);
-    if (m.loserName)  gains[m.loserName]  = (gains[m.loserName]  || 0) + (m.p2delta || 0);
+    if (m.p1name) gains[m.p1name] = (gains[m.p1name] || 0) + (m.p1delta || 0);
+    if (m.p2name) gains[m.p2name] = (gains[m.p2name] || 0) + (m.p2delta || 0);
   }
 
   const sorted = Object.entries(gains).sort((a, b) => b[1] - a[1]).slice(0, 5);
-  const lines = sorted.map(([name, delta], i) =>
-    `${rankEmoji(i + 1)} **${name}** — ${signed(Math.round(delta * 10) / 10)} elo this week`
+  const lines  = sorted.map(([name, delta], i) =>
+    `${rankEmoji(i + 1)} **${name}** — ${signed(Math.round(delta * 10) / 10)} pts this week`
   ).join('\n');
 
   const embed = new EmbedBuilder()
@@ -734,7 +890,7 @@ async function cmdHot(message) {
   await message.reply({ embeds: [embed] });
 }
 
-// ── COMMAND: ttt add [player] ────────────────────────────────────────────────
+// ── COMMAND: ttt add [player] ─────────────────────────────────────────────────
 async function cmdAddPlayer(message, args) {
   if (!args.length) return message.reply('Usage: `ttt add [name]`');
   const name = args.join(' ').trim();
@@ -742,20 +898,21 @@ async function cmdAddPlayer(message, args) {
   const existing = await findPlayer(name);
   if (existing) return message.reply(`❌ **${existing.name}** already exists on the leaderboard.`);
 
+  const anchor = _rdNewAnchor(120, Date.now());
   await db.collection('players').add({
     name,
-    rating: 1500,
-    rd: 120,
-    sigma: SIGMA_DEFAULT,
-    wins: 0,
-    losses: 0,
-    lastDecayAt: Date.now(),
-    createdAt: FieldValue.serverTimestamp(),
+    rating:     1500,
+    rd:         120,
+    rdAnchorRD: anchor.rdAnchorRD,
+    rdAnchorSec: anchor.rdAnchorSec,
+    wins:       0,
+    losses:     0,
+    createdAt:  FieldValue.serverTimestamp(),
   });
 
   const embed = new EmbedBuilder()
     .setColor(0x7ec8a0)
-    .setTitle(`✅ Player Added`)
+    .setTitle('✅ Player Added')
     .setDescription(`**${name}** has joined the leaderboard with a starting rating of **1500**.`)
     .setFooter(footer())
     .setTimestamp();
@@ -791,19 +948,20 @@ client.on('messageCreate', async message => {
 
     await message.channel.sendTyping();
     try {
-      if (!cmd || cmd === 'help')                 return await cmdHelp(message);
-      if (cmd === 'stats')                        return await cmdStats(message, parts.slice(1));
-      if (cmd === 'history')                      return await cmdHistory(message, parts.slice(1));
-      if (cmd === 'rank')                         return await cmdRank(message, parts.slice(1));
-      if (cmd === 'top')                          return await cmdTop(message);
-      if (cmd === 'predict')                      return await cmdPredict(message, parts.slice(1));
-      if (cmd === 'vs')                           return await cmdVs(message, parts.slice(1));
-      if (cmd === 'rating' && sub === 'farm')     return await cmdRatingFarm(message, parts.slice(2));
-      if (cmd === 'streak')                       return await cmdStreak(message);
-      if (cmd === 'nemesis')                      return await cmdNemesis(message, parts.slice(1));
-      if (cmd === 'rivals')                       return await cmdRivals(message);
-      if (cmd === 'hot')                          return await cmdHot(message);
-      if (cmd === 'add')                          return await cmdAddPlayer(message, parts.slice(1));
+      if (!cmd || cmd === 'help')              return await cmdHelp(message);
+      if (cmd === 'stats')                     return await cmdStats(message, parts.slice(1));
+      if (cmd === 'history')                   return await cmdHistory(message, parts.slice(1));
+      if (cmd === 'rank')                      return await cmdRank(message, parts.slice(1));
+      if (cmd === 'rd')                        return await cmdRD(message, parts.slice(1));
+      if (cmd === 'top')                       return await cmdTop(message);
+      if (cmd === 'predict')                   return await cmdPredict(message, parts.slice(1));
+      if (cmd === 'vs')                        return await cmdVs(message, parts.slice(1));
+      if (cmd === 'rating' && sub === 'farm')  return await cmdRatingFarm(message, parts.slice(2));
+      if (cmd === 'streak')                    return await cmdStreak(message);
+      if (cmd === 'nemesis')                   return await cmdNemesis(message, parts.slice(1));
+      if (cmd === 'rivals')                    return await cmdRivals(message);
+      if (cmd === 'hot')                       return await cmdHot(message);
+      if (cmd === 'add')                       return await cmdAddPlayer(message, parts.slice(1));
     } catch (err) {
       console.error('Command error:', err);
       return message.reply(`❌ Error: ${err.message}`);
