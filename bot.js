@@ -2,6 +2,8 @@
 //
 // Match reporting (first player always wins):
 //   inoo ath  /  inoo ath 10-8  /  inoo ath 10 8  /  inoo 10 ath 8
+//   Add 15 or 21 at the end for format: inoo ath 10-8 15  /  inoo ath 21
+//   Default format is ft11.
 //
 // Commands (prefix: ttt):
 //   ttt help
@@ -25,7 +27,6 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 // ── CONFIG ────────────────────────────────────────────────────────────────────
 const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
 const CHANNEL_ID          = process.env.CHANNEL_ID ? process.env.CHANNEL_ID.split(',').map(s => s.trim()) : null;
-console.log('CHANNEL_ID raw:', process.env.CHANNEL_ID);
 const FIREBASE_PROJECT_ID = 'tttiw-6d44e';
 const PREFIX              = 'ttt';
 
@@ -40,8 +41,8 @@ initializeApp({ credential: firebaseCredential, projectId: FIREBASE_PROJECT_ID }
 const db = getFirestore();
 
 // ── DECAY CONFIG (loaded from Firestore, updated via snapshot) ────────────────
-let DECAY_SCALE_MULTIPLIER  = 0;   // m in: rate = g * (1500/rating)^m
-let DECAY_GENERAL_MULTIPLIER = 1;  // g in: rate = g * (1500/rating)^m
+let DECAY_SCALE_MULTIPLIER   = 0;
+let DECAY_GENERAL_MULTIPLIER = 1;
 
 db.doc('config/decay').onSnapshot(snap => {
   if (!snap.exists) return;
@@ -51,7 +52,7 @@ db.doc('config/decay').onSnapshot(snap => {
   console.log(`🔄 Decay config updated: g=${DECAY_GENERAL_MULTIPLIER} m=${DECAY_SCALE_MULTIPLIER}`);
 });
 
-// ── GLICKO-2 (simplified — matches index.html exactly, no sigma/volatility) ──
+// ── GLICKO-2 (matches index.html exactly — no sigma/volatility) ───────────────
 const SCALE  = 173.7178;
 const RD_MAX = 200;
 
@@ -67,7 +68,7 @@ function g2Update(player, opps) {
   for (const o of opps) {
     const { mu: muj, phi: phij } = toG2(o.rating, o.rd);
     const gj = gPhi(phij), ej = E(mu, muj, phij);
-    vInv += gj * gj * ej * (1 - ej);
+    vInv    += gj * gj * ej * (1 - ej);
     deltaSum += gj * (o.s - ej);
   }
   const v      = 1 / vInv;
@@ -77,21 +78,32 @@ function g2Update(player, opps) {
   return { rating: r.r, rd: Math.min(r.rd, RD_MAX) };
 }
 
+// ── FORMAT MULTIPLIER (mirrors _ftMult in index.html exactly) ────────────────
+// Scales rating gain/loss by format length relative to ft11 baseline.
+function _ftMult(pWin, ftN) {
+  if (ftN === 11) return 1;
+  // Expected score from ft11 perspective, then calibrate for ftN
+  const p11 = pWin; // already ft11 win probability
+  if (p11 <= 0 || p11 >= 1) return 1;
+  // P(win ftN) using normal approximation on points won
+  const mu = ftN * (p11 - 0.5);
+  const sig = Math.sqrt(ftN * p11 * (1 - p11));
+  if (sig <= 0) return 1;
+  // Φ(mu/sig) — standard normal CDF approximation
+  const z = mu / sig;
+  const pN = 0.5 * (1 + Math.sign(z) * (1 - Math.exp(-0.7978845608 * Math.abs(z) * (1 + 0.0433 * z * z))));
+  if (pN <= 0 || pN >= 1) return 1;
+  // multiplier = log(pN) / log(p11)  (same ratio of log-probabilities as site)
+  return Math.log(pN) / Math.log(p11);
+}
+
 function winProb(a, b) {
-  const { mu, phi }        = toG2(a.rating, a.rd);
+  const { mu, phi }            = toG2(a.rating, a.rd);
   const { mu: muj, phi: phij } = toG2(b.rating, b.rd);
   return (E(mu, muj, Math.sqrt(phi * phi + phij * phij)) * 100).toFixed(1);
 }
 
 // ── RD ANCHOR SYSTEM (integer-second, mirrors index.html exactly) ─────────────
-//
-//   Each player doc has:
-//     rdAnchorRD  — the RD value at the anchor moment
-//     rdAnchorSec — integer Unix seconds when the anchor was set
-//
-//   Live RD = rdAfterSec(rdAnchorRD, rating, floor(now/1000) - rdAnchorSec)
-//   Integer seconds only — no float drift between bot and site.
-//
 const _RD_NUMERATOR       = 30240000;
 const _RD_ASYMPTOTE_SHIFT = 336000;
 const _RD_ASYMPTOTE       = 120;
@@ -100,44 +112,37 @@ const _RD_MAX_NEW         = 120;
 
 function _rdClamp(rd) { return Math.min(_RD_MAX_NEW, Math.max(_RD_MIN, rd == null ? 120 : rd)); }
 
-// Decay rate = g * (1500/rating)^m
 function _rdRatingScale(rating) {
   const m = DECAY_SCALE_MULTIPLIER;
   const g = DECAY_GENERAL_MULTIPLIER > 0 ? DECAY_GENERAL_MULTIPLIER : 1;
-  const ratingScale = (!m || m <= 0) ? 1 : Math.pow(1500 / Math.max(1, rating || 1500), m);
-  return g * ratingScale;
+  const rs = (!m || m <= 0) ? 1 : Math.pow(1500 / Math.max(1, rating || 1500), m);
+  return g * rs;
 }
 
 function _rdToX(rd) {
   if (rd >= _RD_ASYMPTOTE) return Infinity;
-  const d = rd - _RD_ASYMPTOTE;
-  return -_RD_NUMERATOR / d - _RD_ASYMPTOTE_SHIFT;
+  return -_RD_NUMERATOR / (rd - _RD_ASYMPTOTE) - _RD_ASYMPTOTE_SHIFT;
 }
 
 function _rdFromX(x) {
-  const rd = -_RD_NUMERATOR / (x + _RD_ASYMPTOTE_SHIFT) + _RD_ASYMPTOTE;
-  return _rdClamp(rd);
+  return _rdClamp(-_RD_NUMERATOR / (x + _RD_ASYMPTOTE_SHIFT) + _RD_ASYMPTOTE);
 }
 
-// Given anchor RD + rating, return RD after N whole seconds of decay
 function _rdAfterSec(anchorRD, rating, elapsedWholeSec) {
   const clamped = _rdClamp(anchorRD);
   const x0 = _rdToX(clamped);
   if (!isFinite(x0)) return _RD_MAX_NEW;
-  const xNow = x0 + Math.max(0, Math.floor(elapsedWholeSec)) * _rdRatingScale(rating || 1500);
-  return _rdFromX(xNow);
+  return _rdFromX(x0 + Math.max(0, Math.floor(elapsedWholeSec)) * _rdRatingScale(rating || 1500));
 }
 
-// Read anchor from a player object — supports new fields with fallback to old rdBaseTime
 function _rdGetAnchor(p) {
   if (p.rdAnchorSec != null) {
     return { rd: _rdClamp(p.rdAnchorRD ?? p.rd ?? 120), sec: p.rdAnchorSec };
   }
-  // Fallback: old rdBaseTime field
   let ms = Date.now();
   const t = p.rdBaseTime;
   if (t != null) {
-    if (typeof t === 'number')               ms = t > 2e10 ? t : t * 1000;
+    if (typeof t === 'number')                ms = t > 2e10 ? t : t * 1000;
     else if (typeof t.toMillis === 'function') ms = t.toMillis();
     else if (typeof t.toDate   === 'function') ms = t.toDate().getTime();
     else ms = Number(t) || Date.now();
@@ -145,12 +150,10 @@ function _rdGetAnchor(p) {
   return { rd: _rdClamp(p.rd ?? 120), sec: Math.round(ms / 1000) };
 }
 
-// Build anchor fields for writing to Firestore
 function _rdNewAnchor(rd, nowMs) {
   return { rdAnchorRD: _rdClamp(rd), rdAnchorSec: Math.round((nowMs || Date.now()) / 1000) };
 }
 
-// THE live RD function — matches _computeRDLive in index.html exactly
 function computeRDLive(p) {
   if (p.decayImmune) return _rdClamp(p.rdAnchorRD ?? p.rd ?? 120);
   const { rd: anchorRD, sec: anchorSec } = _rdGetAnchor(p);
@@ -158,35 +161,52 @@ function computeRDLive(p) {
   return _rdAfterSec(anchorRD, p.rating || 1500, nowSec - anchorSec);
 }
 
-// Seconds until a player's RD hits 100 (purge threshold)
 function _secsToPurge(p) {
   const lrd = computeRDLive(p);
   if (lrd >= 100) return 0;
   const { rd: anchorRD, sec: anchorSec } = _rdGetAnchor(p);
-  const nowSec    = Math.floor(Date.now() / 1000);
+  const nowSec     = Math.floor(Date.now() / 1000);
   const elapsedNow = nowSec - anchorSec;
-  // binary-search for the second where rd crosses 100
-  const x0     = _rdToX(_rdClamp(anchorRD));
-  const x100   = _rdToX(100);
-  const scale  = _rdRatingScale(p.rating || 1500);
+  const x0         = _rdToX(_rdClamp(anchorRD));
+  const x100       = _rdToX(100);
+  const scale      = _rdRatingScale(p.rating || 1500);
   if (!isFinite(x0) || scale <= 0) return Infinity;
-  const extraSec = Math.ceil((x100 - x0) / scale) - elapsedNow;
-  return Math.max(0, extraSec);
+  return Math.max(0, Math.ceil((x100 - x0) / scale) - elapsedNow);
 }
 
 // ── MATCH PARSER ──────────────────────────────────────────────────────────────
+// Valid formats appended at the end: 15 or 21 (anything else → ft11)
+const VALID_FORMATS = new Set([15, 21]);
+
+function parseFormat(token) {
+  const n = parseInt(token, 10);
+  return VALID_FORMATS.has(n) ? n : 11;
+}
+
 function parseMatchMessage(content) {
   const t = content.trim().split(/\s+/);
-  if (t.length === 4 && /^\d+$/.test(t[1]) && /^\d+$/.test(t[3]))
-    return { winnerStr: t[0], loserStr: t[2], s1: t[1], s2: t[3] };
-  if (t.length === 3 && /^\d+-\d+$/.test(t[2])) {
-    const [s1, s2] = t[2].split('-');
-    return { winnerStr: t[0], loserStr: t[1], s1, s2 };
+
+  // [winner] 10 [loser] 8 [format?]
+  if (t.length >= 4 && /^\d+$/.test(t[1]) && /^\d+$/.test(t[3])) {
+    const format = t.length >= 5 ? parseFormat(t[4]) : 11;
+    return { winnerStr: t[0], loserStr: t[2], s1: t[1], s2: t[3], format };
   }
-  if (t.length === 4 && /^\d+$/.test(t[2]) && /^\d+$/.test(t[3]))
-    return { winnerStr: t[0], loserStr: t[1], s1: t[2], s2: t[3] };
-  if (t.length === 2)
-    return { winnerStr: t[0], loserStr: t[1], s1: null, s2: null };
+  // [winner] [loser] 10-8 [format?]
+  if (t.length >= 3 && /^\d+-\d+$/.test(t[2])) {
+    const [s1, s2] = t[2].split('-');
+    const format = t.length >= 4 ? parseFormat(t[3]) : 11;
+    return { winnerStr: t[0], loserStr: t[1], s1, s2, format };
+  }
+  // [winner] [loser] 10 8 [format?]
+  if (t.length >= 4 && /^\d+$/.test(t[2]) && /^\d+$/.test(t[3])) {
+    const format = t.length >= 5 ? parseFormat(t[4]) : 11;
+    return { winnerStr: t[0], loserStr: t[1], s1: t[2], s2: t[3], format };
+  }
+  // [winner] [loser] [format?]  — no score
+  if (t.length >= 2 && !/^\d+$/.test(t[1])) {
+    const format = t.length >= 3 ? parseFormat(t[2]) : 11;
+    return { winnerStr: t[0], loserStr: t[1], s1: null, s2: null, format };
+  }
   return null;
 }
 
@@ -194,6 +214,12 @@ function parseMatchMessage(content) {
 function r2(n)     { return Math.round(n * 10) / 10; }
 function signed(n) { return (n >= 0 ? '+' : '') + r2(n); }
 function pct(w, t) { return t === 0 ? 'N/A' : (w / t * 100).toFixed(1) + '%'; }
+function footer()  { return { text: 'TTTIW · Table Tennis Texas InventionWorks' }; }
+function rat(p)    { return `${r2(p.rating)} ±${r2(computeRDLive(p))}`; }
+
+function fmtLabel(format) {
+  return format && format !== 11 ? ` · ft${format}` : '';
+}
 
 function rankEmoji(rank) {
   if (rank === 1) return '🥇';
@@ -201,11 +227,6 @@ function rankEmoji(rank) {
   if (rank === 3) return '🥉';
   return `#${rank}`;
 }
-
-function footer() { return { text: 'TTTIW · Table Tennis Texas InventionWorks' }; }
-
-// Show live-computed RD so it matches the website
-function rat(p) { return `${r2(p.rating)} ±${r2(computeRDLive(p))}`; }
 
 function fmtDuration(ms) {
   if (!ms || ms <= 0) return '—';
@@ -218,6 +239,7 @@ function fmtDuration(ms) {
   return `${m}m ${s}s`;
 }
 
+// ── FIRESTORE HELPERS ─────────────────────────────────────────────────────────
 async function getAllPlayers() {
   const snap = await db.collection('players').get();
   return snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -237,7 +259,6 @@ async function findPlayer(nameOrMention) {
   ) || null;
 }
 
-// Uses live RD to determine leaderboard visibility — matches site behaviour
 async function getLeaderboard() {
   const players = await getAllPlayers();
   return players.filter(p => computeRDLive(p) <= 100).sort((a, b) => b.rating - a.rating);
@@ -254,7 +275,7 @@ function calcStreak(pid, matchesSortedDesc) {
 }
 
 // ── CORE MATCH SUBMISSION ─────────────────────────────────────────────────────
-async function submitMatch(winner, loser, scoreStr) {
+async function submitMatch(winner, loser, scoreStr, format) {
   return await db.runTransaction(async tx => {
     const [ws, ls] = await Promise.all([
       tx.get(db.collection('players').doc(winner.id)),
@@ -263,19 +284,29 @@ async function submitMatch(winner, loser, scoreStr) {
     if (!ws.exists || !ls.exists) throw new Error('Player not found in Firestore');
 
     const w = ws.data(), l = ls.data();
-
-    // Use live RD at match time — integer-second calc, same as the site
     const wLiveRd = computeRDLive({ ...w, id: winner.id });
     const lLiveRd = computeRDLive({ ...l, id: loser.id });
 
-    const uw = g2Update({ rating: w.rating, rd: wLiveRd }, [{ rating: l.rating, rd: lLiveRd, s: 1 }]);
-    const ul = g2Update({ rating: l.rating, rd: lLiveRd }, [{ rating: w.rating, rd: wLiveRd, s: 0 }]);
+    // Base Glicko-2 update
+    const uwRaw = g2Update({ rating: w.rating, rd: wLiveRd }, [{ rating: l.rating, rd: lLiveRd, s: 1 }]);
+    const ulRaw = g2Update({ rating: l.rating, rd: lLiveRd }, [{ rating: w.rating, rd: wLiveRd, s: 0 }]);
+
+    // Apply format multiplier (ft15/ft21 scale rating gain/loss)
+    const ftN = format || 11;
+    const { mu: wMu, phi: wPhi } = toG2(w.rating, wLiveRd);
+    const { mu: lMu, phi: lPhi } = toG2(l.rating, lLiveRd);
+    const pWin = E(wMu, lMu, lPhi); // winner's ft11 win probability
+    const wMult = _ftMult(pWin, ftN);
+    const lMult = _ftMult(1 - pWin, ftN);
+
+    const uw = { rating: w.rating + (uwRaw.rating - w.rating) * wMult, rd: uwRaw.rd };
+    const ul = { rating: l.rating + (ulRaw.rating - l.rating) * lMult, rd: ulRaw.rd };
 
     const now    = Date.now();
-    // Anchor second = nearest whole second of match time (mirrors site's Math.round)
     const wAnchor = _rdNewAnchor(uw.rd, now);
     const lAnchor = _rdNewAnchor(ul.rd, now);
 
+    // #1 tracking
     const allSnap  = await db.collection('players').get();
     const allP     = allSnap.docs.map(d => ({ id: d.id, ...d.data() }));
     const ranked   = p => computeRDLive(p) <= 100;
@@ -328,7 +359,9 @@ async function submitMatch(winner, loser, scoreStr) {
       winnerName: w.name,  loserName: l.name,
       p1id: winner.id, p2id: loser.id,
       p1name: w.name,  p2name: l.name,
-      score: 1, matchScore: scoreStr || null,
+      score: 1,
+      matchScore: scoreStr || null,
+      format: ftN,
       p1delta: Math.round((uw.rating - w.rating) * 10) / 10,
       p2delta: Math.round((ul.rating - l.rating) * 10) / 10,
       p1oldRD: wLiveRd, p2oldRD: lLiveRd,
@@ -339,13 +372,13 @@ async function submitMatch(winner, loser, scoreStr) {
       date: FieldValue.serverTimestamp(),
     });
 
-    return { w, l, uw, ul, wLiveRd, lLiveRd, topBefore, topAfter, no1Change: topBefore?.id !== topAfter?.id };
+    return { w, l, uw, ul, wLiveRd, lLiveRd, topBefore, topAfter, no1Change: topBefore?.id !== topAfter?.id, format: ftN };
   });
 }
 
 // ── MATCH RESULT EMBED ────────────────────────────────────────────────────────
 async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
-  const { w, l, uw, ul, wLiveRd, lLiveRd, no1Change, topAfter } = result;
+  const { w, l, uw, ul, wLiveRd, lLiveRd, no1Change, topAfter, format } = result;
   const wDelta = Math.round((uw.rating - w.rating) * 10) / 10;
   const lDelta = Math.round((ul.rating - l.rating) * 10) / 10;
 
@@ -363,9 +396,12 @@ async function buildResultEmbed(winnerData, loserData, result, scoreStr) {
     return `RD: ±${r2(liveRd)} → ±${r2(newRd)} (${signed(delta)})`;
   };
 
+  const formatTag = format && format !== 11 ? ` [ft${format}]` : '';
+  const title = `⚡ ${w.name} def. ${l.name}${scoreStr ? `  ${scoreStr}` : ''}${formatTag}`;
+
   const embed = new EmbedBuilder()
     .setColor(0xE5B25D)
-    .setTitle(`⚡ ${w.name} def. ${l.name}${scoreStr ? `  ${scoreStr}` : ''}`)
+    .setTitle(title)
     .addFields(
       {
         name: `🏆 ${w.name}`,
@@ -405,11 +441,13 @@ async function cmdHelp(message) {
       {
         name: '📥 Reporting a Match',
         value: [
-          '`[winner] [loser]` — no score',
-          '`[winner] [loser] 10-8` — with dash',
-          '`[winner] [loser] 10 8` — with space',
+          '`[winner] [loser]` — no score, ft11',
+          '`[winner] [loser] 10-8` — with score, ft11',
+          '`[winner] [loser] 10 8` — space-separated score',
           '`[winner] 10 [loser] 8` — interleaved',
-          '_First player is always the winner_',
+          '`[winner] [loser] 10-8 15` — ft15 format',
+          '`[winner] [loser] 10-8 21` — ft21 format',
+          '_First player is always the winner. Default format is ft11._',
         ].join('\n'),
       },
       {
@@ -424,7 +462,7 @@ async function cmdHelp(message) {
       },
       {
         name: '🏆 Leaderboard',
-        value: '`ttt top` — full leaderboard',
+        value: '`ttt top` — full leaderboard with rank changes',
         inline: true,
       },
       {
@@ -460,12 +498,12 @@ async function cmdStats(message, args) {
   const player = await findPlayer(args[0]);
   if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
 
-  const matches  = await getAllMatches();
+  const matches   = await getAllMatches();
   const myMatches = matches.filter(m => m.winnerId === player.id || m.loserId === player.id);
-  const wins     = myMatches.filter(m => m.winnerId === player.id).length;
-  const losses   = myMatches.filter(m => m.loserId  === player.id).length;
-  const streak   = calcStreak(player.id, myMatches);
-  const liveRd   = computeRDLive(player);
+  const wins      = myMatches.filter(m => m.winnerId === player.id).length;
+  const losses    = myMatches.filter(m => m.loserId  === player.id).length;
+  const streak    = calcStreak(player.id, myMatches);
+  const liveRd    = computeRDLive(player);
 
   const lb   = await getLeaderboard();
   const rank = lb.findIndex(p => p.id === player.id) + 1;
@@ -481,12 +519,12 @@ async function cmdStats(message, args) {
     .setColor(0xE5B25D)
     .setTitle(`👤 ${player.name}`)
     .addFields(
-      { name: 'Rating',   value: `**${r2(player.rating)}**`,                     inline: true },
-      { name: 'RD',       value: `**±${r2(liveRd)}**`,                           inline: true },
-      { name: 'Rank',     value: rank ? rankEmoji(rank) : '_Unranked_',          inline: true },
-      { name: 'Record',   value: `${wins}W – ${losses}L`,                        inline: true },
-      { name: 'Win Rate', value: pct(wins, wins + losses),                       inline: true },
-      { name: 'Streak',   value: streak > 0 ? `🔥 ${streak} wins` : '—',        inline: true },
+      { name: 'Rating',    value: `**${r2(player.rating)}**`,              inline: true },
+      { name: 'RD',        value: `**±${r2(liveRd)}**`,                   inline: true },
+      { name: 'Rank',      value: rank ? rankEmoji(rank) : '_Unranked_',   inline: true },
+      { name: 'Record',    value: `${wins}W – ${losses}L`,                 inline: true },
+      { name: 'Win Rate',  value: pct(wins, wins + losses),                inline: true },
+      { name: 'Streak',    value: streak > 0 ? `🔥 ${streak} wins` : '—', inline: true },
       { name: 'RD Status', value: rdStatus },
     )
     .setFooter(footer())
@@ -500,7 +538,7 @@ async function cmdHistory(message, args) {
   const player = await findPlayer(args[0]);
   if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
 
-  const matches  = await getAllMatches();
+  const matches   = await getAllMatches();
   const myMatches = matches
     .filter(m => m.winnerId === player.id || m.loserId === player.id)
     .slice(0, 5);
@@ -512,9 +550,10 @@ async function cmdHistory(message, args) {
     const opp   = won ? m.loserName : m.winnerName;
     const delta = won ? m.p1delta : m.p2delta;
     const score = m.matchScore ? ` ${m.matchScore}` : '';
+    const fmt   = m.format && m.format !== 11 ? ` ft${m.format}` : '';
     const ts    = m.date?.toDate ? m.date.toDate() : new Date(m.date);
     const date  = ts.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    return `${won ? '✅' : '❌'} **${won ? 'W' : 'L'}** vs ${opp}${score}  (${signed(delta)})  · ${date}`;
+    return `${won ? '✅' : '❌'} **${won ? 'W' : 'L'}** vs ${opp}${score}${fmt}  (${signed(delta)})  · ${date}`;
   }).join('\n');
 
   const embed = new EmbedBuilder()
@@ -546,18 +585,16 @@ async function cmdRD(message, args) {
   const player = await findPlayer(args[0]);
   if (!player) return message.reply(`❌ Player not found: **${args[0]}**`);
 
-  const liveRd = computeRDLive(player);
+  const liveRd      = computeRDLive(player);
   const { sec: anchorSec } = _rdGetAnchor(player);
-  const nowSec = Math.floor(Date.now() / 1000);
-  const elapsedSec = nowSec - anchorSec;
-
-  const isHidden = liveRd > 100;
+  const nowSec      = Math.floor(Date.now() / 1000);
+  const elapsedSec  = nowSec - anchorSec;
   const secsToPurge = _secsToPurge(player);
 
   let statusLine;
   if (player.decayImmune) {
     statusLine = '🛡️ Decay immune — RD frozen';
-  } else if (isHidden) {
+  } else if (liveRd > 100) {
     statusLine = '⚠️ Currently **hidden** from leaderboard (RD > 100) — play a match to get back on!';
   } else {
     statusLine = secsToPurge < 3600
@@ -570,14 +607,14 @@ async function cmdRD(message, args) {
   const currentRate = (g * ((!m || m <= 0) ? 1 : Math.pow(1500 / Math.max(1, player.rating || 1500), m))).toFixed(3);
 
   const embed = new EmbedBuilder()
-    .setColor(isHidden ? 0xd9534f : liveRd > 80 ? 0xE5B25D : 0x7ec8a0)
+    .setColor(liveRd > 100 ? 0xd9534f : liveRd > 80 ? 0xE5B25D : 0x7ec8a0)
     .setTitle(`📡 RD Status — ${player.name}`)
     .addFields(
-      { name: 'Live RD',       value: `**±${r2(liveRd)}**`,                    inline: true },
-      { name: 'Rating',        value: `**${r2(player.rating)}**`,              inline: true },
-      { name: 'Decay Rate',    value: `**${currentRate}×** (g=${g}, m=${m})`, inline: true },
-      { name: 'Anchor age',    value: fmtDuration(elapsedSec * 1000),         inline: true },
-      { name: 'Status',        value: statusLine },
+      { name: 'Live RD',    value: `**±${r2(liveRd)}**`,                    inline: true },
+      { name: 'Rating',     value: `**${r2(player.rating)}**`,              inline: true },
+      { name: 'Decay Rate', value: `**${currentRate}×** (g=${g}, m=${m})`, inline: true },
+      { name: 'Anchor Age', value: fmtDuration(elapsedSec * 1000),         inline: true },
+      { name: 'Status',     value: statusLine },
     )
     .setFooter(footer())
     .setTimestamp();
@@ -590,8 +627,6 @@ async function cmdTop(message) {
   if (!lb.length) return message.reply('No ranked players yet.');
 
   const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
-
-  // Find each player's rating before their oldest recent match (for rank-change arrows)
   const oldRatingMap = {};
   for (const p of lb) {
     const recentMatches = allMatches.filter(m => {
@@ -645,11 +680,8 @@ async function cmdPredict(message, args) {
   if (!p2) return message.reply(`❌ Player not found: **${args[1]}**`);
   if (p1.id === p2.id) return message.reply(`❌ That's the same person!`);
 
-  // Use live RD for predictions so they match what the site would show
-  const p1rd = computeRDLive(p1);
-  const p2rd = computeRDLive(p2);
-  const p1Live = { ...p1, rd: p1rd };
-  const p2Live = { ...p2, rd: p2rd };
+  const p1rd = computeRDLive(p1), p2rd = computeRDLive(p2);
+  const p1Live = { ...p1, rd: p1rd }, p2Live = { ...p2, rd: p2rd };
 
   const p1WinPct = winProb(p1Live, p2Live);
   const p2WinPct = (100 - parseFloat(p1WinPct)).toFixed(1);
@@ -708,6 +740,16 @@ async function cmdVs(message, args) {
   const p2w   = h2h.filter(m => m.winnerId === p2.id).length;
   const total = h2h.length;
 
+  // Recent form (last 5 h2h)
+  const recentLines = h2h.slice(0, 5).map(m => {
+    const winner = m.winnerId === p1.id ? p1.name : p2.name;
+    const score  = m.matchScore ? ` ${m.matchScore}` : '';
+    const fmt    = m.format && m.format !== 11 ? ` ft${m.format}` : '';
+    const ts     = m.date?.toDate ? m.date.toDate() : new Date(m.date);
+    const date   = ts.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    return `**${winner}**${score}${fmt} · ${date}`;
+  }).join('\n');
+
   const embed = new EmbedBuilder()
     .setColor(0xc9a0dc)
     .setTitle(`🏓 ${p1.name} vs ${p2.name}`)
@@ -727,7 +769,8 @@ async function cmdVs(message, args) {
         value: total > 0
           ? `${p1.name} **${p1w}** – **${p2w}** ${p2.name}  _(${total} match${total !== 1 ? 'es' : ''})_`
           : '_No matches played yet_',
-      }
+      },
+      ...(recentLines ? [{ name: 'Recent Matches', value: recentLines }] : [])
     )
     .setFooter(footer())
     .setTimestamp();
@@ -901,13 +944,13 @@ async function cmdAddPlayer(message, args) {
   const anchor = _rdNewAnchor(120, Date.now());
   await db.collection('players').add({
     name,
-    rating:     1500,
-    rd:         120,
-    rdAnchorRD: anchor.rdAnchorRD,
+    rating:      1500,
+    rd:          120,
+    rdAnchorRD:  anchor.rdAnchorRD,
     rdAnchorSec: anchor.rdAnchorSec,
-    wins:       0,
-    losses:     0,
-    createdAt:  FieldValue.serverTimestamp(),
+    wins:        0,
+    losses:      0,
+    createdAt:   FieldValue.serverTimestamp(),
   });
 
   const embed = new EmbedBuilder()
@@ -932,10 +975,7 @@ client.once('clientReady', () => {
 
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
-  if (CHANNEL_ID && !CHANNEL_ID.includes(message.channelId)) {
-    console.log(`⏭ Ignored message in channel ${message.channelId} (not in allowed list: ${CHANNEL_ID.join(', ')})`);
-    return;
-  }
+  if (CHANNEL_ID && !CHANNEL_ID.includes(message.channelId)) return;
 
   const content = message.content.trim();
 
@@ -948,20 +988,20 @@ client.on('messageCreate', async message => {
 
     await message.channel.sendTyping();
     try {
-      if (!cmd || cmd === 'help')              return await cmdHelp(message);
-      if (cmd === 'stats')                     return await cmdStats(message, parts.slice(1));
-      if (cmd === 'history')                   return await cmdHistory(message, parts.slice(1));
-      if (cmd === 'rank')                      return await cmdRank(message, parts.slice(1));
-      if (cmd === 'rd')                        return await cmdRD(message, parts.slice(1));
-      if (cmd === 'top')                       return await cmdTop(message);
-      if (cmd === 'predict')                   return await cmdPredict(message, parts.slice(1));
-      if (cmd === 'vs')                        return await cmdVs(message, parts.slice(1));
-      if (cmd === 'rating' && sub === 'farm')  return await cmdRatingFarm(message, parts.slice(2));
-      if (cmd === 'streak')                    return await cmdStreak(message);
-      if (cmd === 'nemesis')                   return await cmdNemesis(message, parts.slice(1));
-      if (cmd === 'rivals')                    return await cmdRivals(message);
-      if (cmd === 'hot')                       return await cmdHot(message);
-      if (cmd === 'add')                       return await cmdAddPlayer(message, parts.slice(1));
+      if (!cmd || cmd === 'help')             return await cmdHelp(message);
+      if (cmd === 'stats')                    return await cmdStats(message, parts.slice(1));
+      if (cmd === 'history')                  return await cmdHistory(message, parts.slice(1));
+      if (cmd === 'rank')                     return await cmdRank(message, parts.slice(1));
+      if (cmd === 'rd')                       return await cmdRD(message, parts.slice(1));
+      if (cmd === 'top')                      return await cmdTop(message);
+      if (cmd === 'predict')                  return await cmdPredict(message, parts.slice(1));
+      if (cmd === 'vs')                       return await cmdVs(message, parts.slice(1));
+      if (cmd === 'rating' && sub === 'farm') return await cmdRatingFarm(message, parts.slice(2));
+      if (cmd === 'streak')                   return await cmdStreak(message);
+      if (cmd === 'nemesis')                  return await cmdNemesis(message, parts.slice(1));
+      if (cmd === 'rivals')                   return await cmdRivals(message);
+      if (cmd === 'hot')                      return await cmdHot(message);
+      if (cmd === 'add')                      return await cmdAddPlayer(message, parts.slice(1));
     } catch (err) {
       console.error('Command error:', err);
       return message.reply(`❌ Error: ${err.message}`);
@@ -973,11 +1013,14 @@ client.on('messageCreate', async message => {
   const parsed = parseMatchMessage(content);
   if (!parsed) return;
 
-  const { winnerStr, loserStr, s1, s2 } = parsed;
+  const { winnerStr, loserStr, s1, s2, format } = parsed;
   const scoreStr = s1 != null ? `${s1}-${s2}` : null;
 
   if (s1 != null && parseInt(s1) <= parseInt(s2)) {
-    return message.reply(`❌ First player is the winner — their score (${s1}) should be higher than the loser's (${s2}). Did you mean \`${loserStr} ${winnerStr} ${s2}-${s1}\`?`);
+    return message.reply(
+      `❌ First player is the winner — their score (${s1}) should be higher than the loser's (${s2}). ` +
+      `Did you mean \`${loserStr} ${winnerStr} ${s2}-${s1}\`?`
+    );
   }
 
   await message.channel.sendTyping();
@@ -987,13 +1030,90 @@ client.on('messageCreate', async message => {
   if (winner.id === loser.id) return message.reply(`❌ A player can't play themselves!`);
 
   try {
-    const result = await submitMatch(winner, loser, scoreStr);
+    const result = await submitMatch(winner, loser, scoreStr, format);
     const embed  = await buildResultEmbed(winner, loser, result, scoreStr);
     await message.reply({ embeds: [embed] });
   } catch (err) {
     console.error('Match submission error:', err);
     await message.reply(`❌ Error submitting match: ${err.message}`);
   }
+});
+
+// ── WEBSITE MATCH WATCHER ─────────────────────────────────────────────────────
+let _watcherReady = false;
+
+client.once('clientReady', () => {
+  const channelId = CHANNEL_ID?.[0];
+  if (!channelId) { console.log('⚠️  No CHANNEL_ID set — website match watcher disabled.'); return; }
+
+  const startedAt = new Date();
+
+  db.collection('matches')
+    .where('date', '>', startedAt)
+    .orderBy('date', 'asc')
+    .onSnapshot(async snap => {
+      if (!_watcherReady) { _watcherReady = true; return; }
+      for (const change of snap.docChanges()) {
+        if (change.type !== 'added') continue;
+        const m = { id: change.doc.id, ...change.doc.data() };
+        if (m.source === 'discord') continue;
+        try {
+          const channel = await client.channels.fetch(channelId);
+          if (!channel) continue;
+
+          const formatTag = m.format && m.format !== 11 ? ` [ft${m.format}]` : '';
+          const scoreStr  = m.matchScore || null;
+          const wDelta    = m.p1delta ?? 0;
+          const lDelta    = m.p2delta ?? 0;
+          const rdLine    = (oldRd, newRd) => {
+            if (oldRd == null || newRd == null) return '';
+            const d = Math.round((newRd - oldRd) * 10) / 10;
+            return `RD: ±${r2(oldRd)} → ±${r2(newRd)} (${signed(d)})`;
+          };
+
+          const lb    = await getLeaderboard();
+          const wRank = lb.findIndex(p => p.id === m.p1id) + 1;
+          const lRank = lb.findIndex(p => p.id === m.p2id) + 1;
+          const top5  = lb.slice(0, 5).map((p, i) => {
+            const tag = p.id === m.p1id ? ' ← W' : p.id === m.p2id ? ' ← L' : '';
+            return `${rankEmoji(i + 1)} **${p.name}** — ${rat(p)}${tag}`;
+          }).join('\n');
+
+          const embed = new EmbedBuilder()
+            .setColor(0xE5B25D)
+            .setTitle(`⚡ ${m.p1name} def. ${m.p2name}${scoreStr ? `  ${scoreStr}` : ''}${formatTag}`)
+            .addFields(
+              {
+                name: `🏆 ${m.p1name}`,
+                value: [
+                  `${r2(m.p1oldRating)} → **${r2(m.p1newRating)}** (${signed(wDelta)})`,
+                  rdLine(m.p1oldRD, m.p1newRD),
+                  wRank ? `Rank: ${rankEmoji(wRank)}` : '_Unranked_',
+                ].filter(Boolean).join('\n'),
+                inline: true,
+              },
+              {
+                name: `😔 ${m.p2name}`,
+                value: [
+                  `${r2(m.p2oldRating)} → **${r2(m.p2newRating)}** (${signed(lDelta)})`,
+                  rdLine(m.p2oldRD, m.p2newRD),
+                  lRank ? `Rank: ${rankEmoji(lRank)}` : '_Unranked_',
+                ].filter(Boolean).join('\n'),
+                inline: true,
+              },
+              { name: '📊 Top 5 Standings', value: top5 || '_No ranked players yet_' }
+            )
+            .setFooter({ text: 'TTTIW · Table Tennis Texas InventionWorks · via website' })
+            .setTimestamp();
+
+          await channel.send({ embeds: [embed] });
+        } catch (err) {
+          console.error('Website match watcher error:', err);
+        }
+      }
+    }, err => console.error('Firestore match watcher error:', err));
+
+  console.log(`👁️  Watching Firestore for website matches → channel ${channelId}`);
 });
 
 client.login(DISCORD_TOKEN);
