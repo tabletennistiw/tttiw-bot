@@ -27,6 +27,7 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 // ── CONFIG ────────────────────────────────────────────────────────────────────
 const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
 const CHANNEL_ID          = process.env.CHANNEL_ID ? process.env.CHANNEL_ID.split(',').map(s => s.trim()) : null;
+const INTAKE_CHANNEL_ID   = process.env.INTAKE_CHANNEL_ID ?? null; // private webhook-only channel
 const FIREBASE_PROJECT_ID = 'tttiw-6d44e';
 const PREFIX              = 'ttt';
 
@@ -974,6 +975,36 @@ client.once('clientReady', () => {
 });
 
 client.on('messageCreate', async message => {
+  const isIntake = INTAKE_CHANNEL_ID && message.channelId === INTAKE_CHANNEL_ID;
+
+  // Intake channel: only allow webhook messages, parse as match and repost to main channel
+  if (isIntake) {
+    if (!message.webhookId) return; // ignore anything that isn't the Arduino webhook
+    const content = message.content.trim();
+    const parsed  = parseMatchMessage(content);
+    if (!parsed) return;
+
+    const { winnerStr, loserStr, s1, s2, format } = parsed;
+    const scoreStr = s1 != null ? `${s1}-${s2}` : null;
+
+    const outputChannelId = CHANNEL_ID?.[0];
+    if (!outputChannelId) return;
+    const outputChannel = await client.channels.fetch(outputChannelId).catch(() => null);
+    if (!outputChannel) return;
+
+    const [winner, loser] = await Promise.all([findPlayer(winnerStr), findPlayer(loserStr)]);
+    if (!winner || !loser || winner.id === loser.id) return;
+
+    try {
+      const result = await submitMatch(winner, loser, scoreStr, format);
+      const embed  = await buildResultEmbed(winner, loser, result, scoreStr);
+      await outputChannel.send({ embeds: [embed] });
+    } catch (err) {
+      console.error('Intake match submission error:', err);
+    }
+    return;
+  }
+
   if (message.author.bot) return;
   if (CHANNEL_ID && !CHANNEL_ID.includes(message.channelId)) return;
 
