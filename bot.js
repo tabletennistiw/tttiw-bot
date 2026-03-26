@@ -1,3 +1,6 @@
+// Force stdout → stderr so Render doesn't buffer/drop logs
+process.stdout.write = process.stderr.write.bind(process.stderr);
+
 // TTTIW Discord Bot
 //
 // Match reporting (first player always wins):
