@@ -1147,4 +1147,7 @@ client.once('clientReady', () => {
   console.log(`👁️  Watching Firestore for website matches → channel ${channelId}`);
 });
 
+import http from 'http';
+http.createServer((_, res) => res.end('ok')).listen(process.env.PORT || 3000);
+
 client.login(DISCORD_TOKEN);
