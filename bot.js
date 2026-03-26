@@ -968,10 +968,14 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
-client.once('clientReady', () => {
+client.once('clientReady', async () => {
   console.log(`✅ TTTIW bot ready as ${client.user.tag}`);
   if (CHANNEL_ID) console.log(`📌 Watching channels: ${CHANNEL_ID.join(', ')}`);
   else console.log('📌 Watching all channels');
+  if (INTAKE_CHANNEL_ID) {
+    const ch = await client.channels.fetch(INTAKE_CHANNEL_ID).catch(e => { console.log('INTAKE FETCH ERROR:', e.message); return null; });
+    console.log('INTAKE CHANNEL:', ch?.name, ch?.type, ch?.guildId);
+  }
 });
 
 client.on('messageCreate', async message => {
