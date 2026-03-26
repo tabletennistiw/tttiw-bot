@@ -983,7 +983,8 @@ client.once('ready', async () => {
 
 client.on('messageCreate', async message => {
   console.log(`[msg] channel=${message.channelId} webhook=${message.webhookId ?? 'none'} content=${message.content}`);
-  const isIntake = INTAKE_CHANNEL_ID && message.channelId === INTAKE_CHANNEL_ID;
+  const intakeChannelId = CHANNEL_ID?.[1] ?? INTAKE_CHANNEL_ID ?? null;
+  const isIntake = intakeChannelId && message.channelId === intakeChannelId;
 
   // Intake channel: only allow webhook messages, parse as match and repost to main channel
   if (isIntake) {
