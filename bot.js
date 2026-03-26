@@ -968,7 +968,7 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   console.log(`✅ TTTIW bot ready as ${client.user.tag}`);
   if (CHANNEL_ID) console.log(`📌 Watching channels: ${CHANNEL_ID.join(', ')}`);
   else console.log('📌 Watching all channels');
@@ -1078,7 +1078,7 @@ client.on('messageCreate', async message => {
 // ── WEBSITE MATCH WATCHER ─────────────────────────────────────────────────────
 let _watcherReady = false;
 
-client.once('clientReady', () => {
+client.once('ready', () => {
   const channelId = CHANNEL_ID?.[0];
   if (!channelId) { console.log('⚠️  No CHANNEL_ID set — website match watcher disabled.'); return; }
 
